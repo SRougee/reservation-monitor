@@ -40,7 +40,7 @@ async function advanceAvailability(env, force = false) {
   const count = Math.min(4, candidates.length);
   const openedAt = nowIso();
   const statements = candidates.slice(0, count).map(id => env.DB.prepare("UPDATE cells SET status='available',opened_at=? WHERE id=? AND status='grey'").bind(openedAt, id));
-  statements.push(env.DB.prepare("INSERT INTO meta(key,value) VALUES('last_cycle,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(currentCycle)));
+  statements.push(env.DB.prepare("INSERT INTO meta(key,value) VALUES('last_cycle',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(String(currentCycle)));
   await env.DB.batch(statements);
 }
 async function apiState(request, env) {
