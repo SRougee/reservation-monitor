@@ -1,21 +1,19 @@
-const COOKIE = "rm_session";
 const OPEN_INTERVAL_MS = 30_000;
 
-function json(data, status = 200) {
+function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", ...headers },
   });
 }
 function nowIso() { return new Date().toISOString(); }
 function cycleNumber() { return Math.floor(Date.now() / OPEN_INTERVAL_MS); }
-function getCookie(request, name) {
-  const value = request.headers.get("Cookie") || "";
-  const match = value.split(";").map(v => v.trim()).find(v => v.startsWith(name + "="));
-  return match ? decodeURIComponent(match.slice(name.length + 1)) : null;
+function getBearerToken(request) {
+  const header = request.headers.get("Authorization") || "";
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : null;
 }
 async function userFromRequest(request, env) {
-  const token = getCookie(request, COOKIE);
+  const token = getBearerToken(request);
   if (!token) return null;
   return await env.DB.prepare("SELECT username, role FROM sessions WHERE token = ?").bind(token).first();
 }
@@ -58,12 +56,12 @@ async function login(request, env) {
   if (!user) return json({ error: "Invalid username or password" }, 401);
   const token = crypto.randomUUID();
   await env.DB.prepare("INSERT INTO sessions(token,username,role) VALUES(?,?,?)").bind(token, user.username, user.role).run();
-  return new Response(JSON.stringify({ ok: true, user }), { headers: { "content-type": "application/json", "cache-control": "no-store", "set-cookie": `${COOKIE}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400` } });
+  return json({ ok: true, user, token });
 }
 async function logout(request, env) {
-  const token = getCookie(request, COOKIE);
+  const token = getBearerToken(request);
   if (token) await env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(token).run();
-  return new Response(null, { status: 204, headers: { "set-cookie": `${COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0` } });
+  return new Response(null, { status: 204 });
 }
 async function reserve(request, env) {
   const user = await userFromRequest(request, env);
