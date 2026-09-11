@@ -1,0 +1,7 @@
+# Do not publish files accidentally placed in the static asset directory
+.assetsignore
+schema.sql
+wrangler.toml
+package.json
+README.md
+DEPLOY.md
