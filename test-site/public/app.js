@@ -1,8 +1,16 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
+const TOKEN_KEY = "rm_session_token";
 
+function authHeaders() {
+  const token = sessionStorage.getItem(TOKEN_KEY);
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
 async function api(path, options={}) {
-  const response = await fetch(path, { ...options, headers: { "content-type": "application/json", ...(options.headers||{}) } });
+  const response = await fetch(path, {
+    ...options,
+    headers: { "content-type": "application/json", ...authHeaders(), ...(options.headers||{}) }
+  });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
@@ -11,18 +19,22 @@ function renderHeader(user) {
   const nav = $("#nav");
   if (!nav) return;
   nav.innerHTML = user ? `<a href="/landing.html">Home</a><a href="/dummy.html">Dummy Page</a><a href="/reservation.html">Reservations</a>${user.role==='admin'?'<a href="/admin.html">Admin Log</a>':''}<button id="logout">Logout</button>` : '';
-  $("#logout")?.addEventListener("click", async()=>{await api('/api/logout',{method:'POST'});location.href='/';});
+  $("#logout")?.addEventListener("click", async()=>{await api('/api/logout',{method:'POST'});sessionStorage.removeItem(TOKEN_KEY);location.href='/';});
 }
 async function currentUser() { try { const data=await api('/api/state'); return data.user; } catch { return null; } }
 async function guard() {
   const user=await currentUser();
-  if(!user) { location.href='/'; return null; }
+  if(!user) { sessionStorage.removeItem(TOKEN_KEY); location.href='/'; return null; }
   renderHeader(user); return user;
 }
 async function initLogin() {
   $("#loginForm")?.addEventListener("submit",async(e)=>{
     e.preventDefault(); $("#loginError").textContent='';
-    try { await api('/api/login',{method:'POST',body:JSON.stringify({username:$("#username").value,password:$("#password").value})}); location.href='/landing.html'; }
+    try {
+      const result = await api('/api/login',{method:'POST',body:JSON.stringify({username:$("#username").value,password:$("#password").value})});
+      sessionStorage.setItem(TOKEN_KEY, result.token);
+      location.href='/landing.html';
+    }
     catch(err){$("#loginError").textContent=err.message;}
   });
 }
@@ -36,7 +48,7 @@ async function loadGrid() {
     if(cell.status==='available') el.addEventListener('click',()=>el.classList.toggle('selected'));
     grid.appendChild(el);
   }
-  if($("#cycleInfo")) $("#cycleInfo").textContent=`Availability changes every ${data.cycleMs/1000} seconds. White cells remain available until reserved.`;
+  if($("#cycleInfo")) $("#cycleInfo").textContent=`Availability changes every ${data.cycleMs/1000} seconds. White cells remain available until reserved. Press Reload Availability to see new changes.`;
   return data;
 }
 async function initReservation() {
@@ -49,15 +61,12 @@ async function initReservation() {
     if(!ids.length){$("#message").textContent='Select one or more white cells first.';return;}
     try{
       const result=await api('/api/reserve',{method:'POST',body:JSON.stringify({cellIds:ids})});
-      // Reservation is the exception to manual reload: immediately reflect the successful reservation.
       await loadGrid();
       $("#message").textContent=`Reserved cells: ${result.reserved.join(', ')} by ${result.username}. The reservation has been recorded in the log.`;
     }
     catch(e){$("#message").textContent=e.message;}
   });
   await loadGrid();
-  // No automatic polling. Availability changes are fetched only by Reload Availability,
-  // except that a successful reservation refreshes the grid immediately.
 }
 async function initAdmin(){
   const user=await guard(); if(!user||user.role!=='admin'){if(user) location.href='/landing.html';return;}
@@ -73,8 +82,6 @@ async function initAdmin(){
     await loadGrid();
   }
   await loadAdmin();
-  // Keep the reservation log current, but do not automatically refresh the cell grid.
-  // The grid changes only on initial load, an admin action, or an explicit user reload.
   setInterval(async()=>{try{await loadLog();}catch{}},3000);
 }
 async function initStandardPage(){ if($("#loginForm")||$("#reservationPage")||$("#adminPage"))return; await guard(); }
