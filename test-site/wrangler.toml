@@ -10,10 +10,8 @@ directory = "./public"
 binding = "ASSETS"
 run_worker_first = ["/api/*"]
 
-# Create the D1 database first with:
-#   npx wrangler d1 create reservation-monitor-test
-# Then replace <YOUR-D1-DATABASE-ID> below with the returned ID.
+# D1 database binding used by worker/index.js as env.DB.
 [[d1_databases]]
 binding = "DB"
 database_name = "reservation-monitor-test"
-database_id = "<YOUR-D1-DATABASE-ID>"
+database_id = "2572f735-698e-4aba-babe-37aaeb38ef63"
