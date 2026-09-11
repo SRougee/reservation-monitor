@@ -113,7 +113,6 @@ def find_matching_blocks(page):
 
     for index in range(count):
         block = blocks.nth(index)
-
         try:
             if not is_available(block):
                 continue
@@ -134,37 +133,44 @@ def find_matching_blocks(page):
 
 
 def click_reserved(page) -> bool:
+    """Click Reserve Selected, then verify the site's success message."""
     log("Looking for Reserve button...")
 
     try:
+        button = page.locator(RESERVED_BUTTON_SELECTOR).first
+        button.wait_for(state="visible", timeout=5_000)
+        log("Reserve button found.")
+
         message = page.locator(RESERVATION_MESSAGE_SELECTOR)
-        message.wait_for(state="visible", timeout=5_000)
         message_text_before = message.inner_text().strip()
         if DEBUG and message_text_before:
             log(f"Reservation message before click: {message_text_before}")
 
-        button = page.locator(RESERVED_BUTTON_SELECTOR).first
-        button.wait_for(state="visible", timeout=5_000)
-        log("Reserve button found.")
+        # Important: click the button FIRST. The previous version waited for
+        # #message to become visible, but the simulator intentionally leaves
+        # that empty status element until after the reservation is attempted.
         button.click()
         log("Reserve button clicked. Waiting for the website to confirm success...")
 
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             text = message.inner_text().strip()
+
             if text.startswith(RESERVATION_SUCCESS_TEXT):
                 log(f"Website confirmed reservation: {text}")
                 return True
+
             if text and text != message_text_before:
                 log(f"Website reservation response: {text}")
                 return False
+
             time.sleep(0.1)
 
         log("ERROR: Reserve button was clicked, but the website did not confirm a successful reservation.")
         return False
 
     except PlaywrightTimeoutError:
-        log("ERROR: Reserve button or reservation message did not appear within 5 seconds.")
+        log("ERROR: Reserve button did not appear within 5 seconds.")
         return False
     except Exception as exc:
         log(f"ERROR clicking Reserve: {exc}")
@@ -265,14 +271,12 @@ def main() -> None:
         print()
 
         while True:
-            answer = input("Are you ready to start monitoring? [Y/N]: ").strip().lower()
+            answer = input("Are you ready to start monitoring? [Y/N]: ").strip().casefold()
             if answer in {"y", "yes"}:
                 break
-            print("Monitoring has not started. Type Y or YES when you are ready.")
+            print("Waiting. Type Y or YES when you are ready.")
 
-        print()
         log("Monitoring started.")
-
         cycle = 0
 
         while True:
