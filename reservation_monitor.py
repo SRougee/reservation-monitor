@@ -39,7 +39,11 @@ RESERVED_BUTTON_SELECTOR = "#reserveButton"
 REFRESH_BUTTON_SELECTOR = "#reloadGrid"
 RESERVATION_MESSAGE_SELECTOR = "#message"
 RESERVATION_SUCCESS_TEXT = "Reserved cells:"
+
+# Scan the DOM very frequently. The simulator only creates new availability
+# every 30 seconds, so the refresh itself is kept separate from the scan.
 CHECK_INTERVAL = 0.10
+REFRESH_INTERVAL = 0.50
 PAGE_LOAD_TIMEOUT = 10_000
 DEBUG = True
 PROFILE_DIR = Path(".browser-profile")
@@ -99,30 +103,55 @@ def matches_target(block) -> bool:
 
 
 def find_matching_blocks(page):
-    """Return every currently available matching block."""
-    blocks = page.locator(BLOCK_SELECTOR)
-    count = blocks.count()
+    """Return every currently available matching block, using a fast CSS query first."""
     matches = []
 
-    if DEBUG:
-        log(f"Found {count} blocks")
+    # Fast path: the simulator marks available cells with the `available`
+    # class. This avoids inspecting all 40 cells on every 0.1s scan.
+    try:
+        fast_locator = page.locator(f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}")
+        fast_count = fast_locator.count()
+        for index in range(fast_count):
+            try:
+                block = fast_locator.nth(index)
+                if not matches_target(block):
+                    continue
+                text = block_text(block)
+                log(
+                    f"AVAILABLE MATCH - block {index + 1}"
+                    + (f": {text[:120]}" if text else "")
+                )
+                matches.append((block, index))
+            except Exception as exc:
+                log(f"Could not inspect available block {index + 1}: {exc}")
+        if fast_count:
+            return matches
+    except Exception as exc:
+        log(f"Fast availability scan failed: {exc}; using fallback scan.")
 
-    for index in range(count):
-        try:
-            block = blocks.nth(index)
-            if not is_available(block):
-                continue
-            if not matches_target(block):
-                continue
+    # Fallback for pages where availability is represented only by a white
+    # background rather than the availability class.
+    try:
+        blocks = page.locator(BLOCK_SELECTOR)
+        count = blocks.count()
+        if DEBUG:
+            log(f"Fallback scan found {count} blocks")
 
-            text = block_text(block)
-            log(
-                f"AVAILABLE MATCH - block {index + 1}"
-                + (f": {text[:120]}" if text else "")
-            )
-            matches.append((block, index))
-        except Exception as exc:
-            log(f"Could not inspect block {index + 1}: {exc}")
+        for index in range(count):
+            try:
+                block = blocks.nth(index)
+                if not is_available(block) or not matches_target(block):
+                    continue
+                text = block_text(block)
+                log(
+                    f"AVAILABLE MATCH - block {index + 1}"
+                    + (f": {text[:120]}" if text else "")
+                )
+                matches.append((block, index))
+            except Exception as exc:
+                log(f"Could not inspect block {index + 1}: {exc}")
+    except Exception as exc:
+        log(f"Fallback availability scan failed: {exc}")
 
     return matches
 
@@ -135,8 +164,20 @@ def get_reservation_message(page) -> str:
         return ""
 
 
+def clear_reservation_message(page) -> None:
+    """Clear a previous response so an old success cannot be mistaken for a new one."""
+    try:
+        page.locator(RESERVATION_MESSAGE_SELECTOR).evaluate(
+            "element => { element.textContent = ''; }"
+        )
+    except Exception:
+        # Clearing is a convenience for the simulator. The actual reservation
+        # result is still verified from the response after the click.
+        pass
+
+
 def click_reserved(page) -> bool:
-    """Click Reserve Selected and verify the normal page response."""
+    """Click Reserve Selected and verify the new page response."""
     log("Looking for Reserve button...")
 
     try:
@@ -144,15 +185,12 @@ def click_reserved(page) -> bool:
         button.wait_for(state="visible", timeout=2_000)
         log("Reserve button found.")
 
-        before = get_reservation_message(page)
-        if DEBUG and before:
-            log(f"Reservation message before click: {before}")
+        # Remove the previous message before the new reservation attempt.
+        clear_reservation_message(page)
 
         button.click()
         log("Reserve button clicked. Waiting for website confirmation...")
 
-        # The monitor verifies only the response shown on the reservation
-        # page itself. It never accesses an admin page or reservation log.
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             text = get_reservation_message(page)
@@ -161,7 +199,7 @@ def click_reserved(page) -> bool:
                 log(f"Website confirmed reservation: {text}")
                 return True
 
-            if text and text != before:
+            if text:
                 log(f"Website reservation response: {text}")
                 return False
 
@@ -216,6 +254,9 @@ def validate_settings() -> None:
     if CHECK_INTERVAL <= 0:
         print("ERROR: CHECK_INTERVAL must be greater than zero.")
         sys.exit(1)
+    if REFRESH_INTERVAL <= 0:
+        print("ERROR: REFRESH_INTERVAL must be greater than zero.")
+        sys.exit(1)
 
 
 def main() -> None:
@@ -226,7 +267,8 @@ def main() -> None:
     print("                 DOM RESERVATION MONITOR")
     print("=" * 64)
     print(f"URL:                 {URL}")
-    print(f"Cycle target:        {CHECK_INTERVAL:.2f} seconds")
+    print(f"DOM scan target:     {CHECK_INTERVAL:.2f} seconds")
+    print(f"Grid refresh target: {REFRESH_INTERVAL:.2f} seconds")
     print(f"Block selector:      {BLOCK_SELECTOR}")
     print(f"Available class:     {AVAILABLE_CLASS or '(disabled)'}")
     print(f"White detection:     {USE_WHITE_BACKGROUND}")
@@ -252,6 +294,7 @@ def main() -> None:
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(2_000)
             ready = False
+            last_refresh = 0.0
 
             while True:
                 if not page_is_alive(page):
@@ -259,6 +302,7 @@ def main() -> None:
                     try:
                         page = context.new_page()
                         page.set_default_timeout(2_000)
+                        ready = False
                     except Exception as exc:
                         log(f"Could not create recovery page: {exc}")
                         time.sleep(1)
@@ -299,6 +343,7 @@ def main() -> None:
                             break
                         print("Waiting. Type Y or YES when you are ready.")
 
+                    last_refresh = 0.0
                     log("Monitoring started. Press Ctrl+C to stop.")
 
                 cycle_start = time.monotonic()
@@ -346,12 +391,18 @@ def main() -> None:
                 if wait_time:
                     time.sleep(wait_time)
 
-                try:
-                    log("Refreshing availability...")
-                    if refresh_availability(page):
-                        log("Availability refresh completed.")
-                except Exception as exc:
-                    log(f"Refresh cycle error: {exc}; continuing.")
+                # Refresh the grid independently of the DOM scan. This keeps
+                # the scanner fast without hammering the site's state API on
+                # every 0.1-second scan.
+                now = time.monotonic()
+                if now - last_refresh >= REFRESH_INTERVAL:
+                    try:
+                        log("Refreshing availability...")
+                        if refresh_availability(page):
+                            last_refresh = time.monotonic()
+                            log("Availability refresh completed.")
+                    except Exception as exc:
+                        log(f"Refresh cycle error: {exc}; continuing.")
 
         except KeyboardInterrupt:
             print()
