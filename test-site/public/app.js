@@ -1,6 +1,7 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const TOKEN_KEY = "rm_session_token";
+const GRID_POLL_MS = 500;
 
 function authHeaders() {
   const token = sessionStorage.getItem(TOKEN_KEY);
@@ -38,24 +39,50 @@ async function initLogin() {
     catch(err){$("#loginError").textContent=err.message;}
   });
 }
+function renderGrid(data) {
+  const grid=$("#grid"); if(!grid)return data;
+  const old = new Map($$(".booking-block").map(el => [Number(el.dataset.cellId), el]));
+  for(const cell of data.cells){
+    let el = old.get(cell.id);
+    const desiredClass = `booking-block ${cell.status}`;
+    if(!el){
+      el=document.createElement('div');
+      el.dataset.cellId=cell.id;
+      grid.appendChild(el);
+      el.addEventListener('click',()=>{
+        if(el.classList.contains('available')) el.classList.toggle('selected');
+      });
+    }
+    if(el.className !== desiredClass) el.className=desiredClass;
+    el.textContent=`${cell.id}`;
+    el.title=cell.status==='red'?'Permanently unavailable':cell.status==='available'?'Available - click to select':'Unavailable';
+    if(cell.status !== 'available') el.classList.remove('selected');
+    old.delete(cell.id);
+  }
+  for(const el of old.values()) el.remove();
+  if($("#cycleInfo")) $("#cycleInfo").textContent=`Availability changes every ${data.cycleMs/1000} seconds. White cells remain available until reserved. The grid updates automatically.`;
+  return data;
+}
 async function loadGrid() {
   const data=await api('/api/state');
-  const grid=$("#grid"); if(!grid)return data;
-  grid.innerHTML='';
-  for(const cell of data.cells){
-    const el=document.createElement('div'); el.className=`booking-block ${cell.status}`; el.dataset.cellId=cell.id; el.textContent=`${cell.id}`;
-    el.title=cell.status==='red'?'Permanently unavailable':cell.status==='available'?'Available - click to select':'Unavailable';
-    if(cell.status==='available') el.addEventListener('click',()=>el.classList.toggle('selected'));
-    grid.appendChild(el);
-  }
-  if($("#cycleInfo")) $("#cycleInfo").textContent=`Availability changes every ${data.cycleMs/1000} seconds. White cells remain available until reserved. Press Reload Availability to see new changes.`;
-  return data;
+  return renderGrid(data);
 }
 async function initReservation() {
   const user=await guard(); if(!user)return;
   let refreshing=false;
-  const refresh=async()=>{if(refreshing)return;refreshing=true;try{await loadGrid();$("#message").textContent='Grid reloaded.';}catch(e){$("#message").textContent=e.message;}finally{refreshing=false;}};
-  $("#reloadGrid").addEventListener('click',refresh);
+  let autoRefreshRunning=true;
+
+  const refresh=async(clearMessage=true)=>{
+    if(refreshing)return;
+    refreshing=true;
+    try{
+      await loadGrid();
+      if(clearMessage) $("#message").textContent='Grid reloaded.';
+    }catch(e){$("#message").textContent=e.message;}
+    finally{refreshing=false;}
+  };
+
+  $("#reloadGrid").addEventListener('click',()=>refresh(true));
   $("#reserveButton").addEventListener('click',async()=>{
     const ids=$$('.booking-block.selected').map(x=>Number(x.dataset.cellId));
     if(!ids.length){$("#message").textContent='Select one or more white cells first.';return;}
@@ -66,7 +93,20 @@ async function initReservation() {
     }
     catch(e){$("#message").textContent=e.message;}
   });
+
   await loadGrid();
+
+  // The real-world simulation is browser-driven: the page's own JavaScript
+  // checks for updated availability and changes the existing DOM in place.
+  // The Python monitor observes those DOM changes rather than clicking
+  // Reload Availability repeatedly.
+  const autoRefresh=async()=>{
+    while(autoRefreshRunning){
+      try { await loadGrid(); } catch {}
+      await new Promise(resolve=>setTimeout(resolve, GRID_POLL_MS));
+    }
+  };
+  autoRefresh();
 }
 async function initAdmin(){
   const user=await guard(); if(!user||user.role!=='admin'){if(user) location.href='/landing.html';return;}
