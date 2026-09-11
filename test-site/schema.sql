@@ -2,6 +2,7 @@ DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS reservations;
 DROP TABLE IF EXISTS cells;
 DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS meta;
 CREATE TABLE users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL UNIQUE,
@@ -29,7 +30,12 @@ CREATE TABLE sessions (
   role TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 INSERT INTO users (username,password,role) VALUES
  ('testuser','test123','user'),
  ('admin','admin123','admin'),
  ('monitor','monitor123','monitor');
+INSERT INTO meta(key,value) VALUES ('last_cycle','-1');
