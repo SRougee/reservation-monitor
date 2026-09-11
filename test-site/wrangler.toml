@@ -1,0 +1,19 @@
+name = "reservation-monitor-test"
+main = "./worker/index.js"
+compatibility_date = "2026-09-11"
+
+# Cloudflare Workers Static Assets
+# IMPORTANT: this path is relative to THIS wrangler.toml file.
+# All browser-facing website files live under test-site/public/.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+# Create the D1 database first with:
+#   npx wrangler d1 create reservation-monitor-test
+# Then replace <YOUR-D1-DATABASE-ID> below with the returned ID.
+[[d1_databases]]
+binding = "DB"
+database_name = "reservation-monitor-test"
+database_id = "<YOUR-D1-DATABASE-ID>"
