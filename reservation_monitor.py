@@ -29,46 +29,21 @@ from playwright.sync_api import (
 # SETTINGS
 # ============================================================
 
-# Reservation-monitor simulator running on Cloudflare Workers.
 URL = "https://reservation-monitor-test.ronaldjennings84.workers.dev/"
-
-# Time allowed for manual login, including CAPTCHA, in seconds.
 LOGIN_TIME_SECONDS = 120
-
-# CSS selector matching the repeated availability blocks.
 BLOCK_SELECTOR = ".booking-block"
-
-# Optional text that must occur inside the target block.
-# Empty means: reserve the first available cell found.
 TARGET_TEXT = ""
-
-# Availability detection.
 AVAILABLE_CLASS = "available"
-
-# The simulator uses a white background for available cells.
 USE_WHITE_BACKGROUND = True
 WHITE_RGB = "rgb(255, 255, 255)"
-
-# Button used to reserve the selected cell.
 RESERVED_BUTTON_SELECTOR = "#reserveButton"
-
-# The simulator deliberately requires an explicit availability refresh.
-# Clicking this button keeps the current tab/session intact.
 REFRESH_BUTTON_SELECTOR = "#reloadGrid"
-
-# Target time for one complete monitor cycle.
+RESERVATION_MESSAGE_SELECTOR = "#message"
+RESERVATION_SUCCESS_TEXT = "Reserved cells:"
 CHECK_INTERVAL = 1.0
-
-# Maximum wait for page navigation/reload.
 PAGE_LOAD_TIMEOUT = 15_000
-
-# Set True while configuring the program to print diagnostic information.
 DEBUG = True
-
-# Keep the browser open after success so you can inspect the result.
 KEEP_BROWSER_OPEN_AFTER_SUCCESS = True
-
-# Persistent browser profile directory.
 PROFILE_DIR = Path(".browser-profile")
 
 
@@ -161,14 +136,36 @@ def click_reserved(page) -> bool:
     log("Looking for Reserve button...")
 
     try:
+        message = page.locator(RESERVATION_MESSAGE_SELECTOR)
+        message.wait_for(state="visible", timeout=5_000)
+        message_text_before = message.inner_text().strip()
+        if DEBUG and message_text_before:
+            log(f"Reservation message before click: {message_text_before}")
+
         button = page.locator(RESERVED_BUTTON_SELECTOR).first
         button.wait_for(state="visible", timeout=5_000)
         log("Reserve button found.")
         button.click()
-        log("Reserve button clicked.")
-        return True
+        log("Reserve button clicked. Waiting for the website to confirm success...")
+
+        # A button click alone is not enough to call the reservation successful.
+        # The simulator writes to D1 and then updates #message with the result.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            text = message.inner_text().strip()
+            if text.startswith(RESERVATION_SUCCESS_TEXT):
+                log(f"Website confirmed reservation: {text}")
+                return True
+            if text and text != message_text_before:
+                log(f"Website reservation response: {text}")
+                return False
+            time.sleep(0.1)
+
+        log("ERROR: Reserve button was clicked, but the website did not confirm a successful reservation.")
+        return False
+
     except PlaywrightTimeoutError:
-        log("ERROR: Reserve button did not appear within 5 seconds.")
+        log("ERROR: Reserve button or reservation message did not appear within 5 seconds.")
         return False
     except Exception as exc:
         log(f"ERROR clicking Reserve: {exc}")
@@ -176,7 +173,6 @@ def click_reserved(page) -> bool:
 
 
 def refresh_availability(page) -> bool:
-    """Refresh only the reservation grid when a refresh button is configured."""
     if REFRESH_BUTTON_SELECTOR:
         try:
             button = page.locator(REFRESH_BUTTON_SELECTOR).first
@@ -191,10 +187,7 @@ def refresh_availability(page) -> bool:
             return False
 
     try:
-        page.reload(
-            wait_until="domcontentloaded",
-            timeout=PAGE_LOAD_TIMEOUT,
-        )
+        page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         return True
     except PlaywrightTimeoutError:
         log("Page reload timed out; continuing with current page.")
@@ -255,11 +248,7 @@ def main() -> None:
 
         try:
             log("Opening website...")
-            page.goto(
-                URL,
-                wait_until="domcontentloaded",
-                timeout=PAGE_LOAD_TIMEOUT,
-            )
+            page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         except Exception as exc:
             log(f"Could not open website: {exc}")
             context.close()
@@ -281,11 +270,7 @@ def main() -> None:
             remaining = LOGIN_TIME_SECONDS - (time.monotonic() - login_start)
             if remaining <= 0:
                 break
-            print(
-                f"\rTime remaining: {int(remaining):3d} seconds",
-                end="",
-                flush=True,
-            )
+            print(f"\rTime remaining: {int(remaining):3d} seconds", end="", flush=True)
             time.sleep(1)
 
         print("\n")
@@ -325,14 +310,17 @@ def main() -> None:
                         print("                  RESERVATION ACTION COMPLETE")
                         print("=" * 64)
                         print()
-                        log("Automation stopped successfully.")
+                        log("Website confirmed the reservation was recorded.")
 
                         if KEEP_BROWSER_OPEN_AFTER_SUCCESS:
-                            input("Press ENTER to close the browser...")
+                            print("The browser will remain open so you can inspect the reservation.")
+                            input("Press ENTER only when you want to close the browser...")
                         break
 
-                    log("Reserve button could not be clicked.")
-                    log("Stopping to prevent an unintended action.")
+                    log("Reservation was NOT confirmed by the website.")
+                    log("Stopping to prevent an unintended repeated action.")
+                    print("Please inspect the browser and the Admin Log before continuing.")
+                    input("Press ENTER to close the browser...")
                     break
 
                 log("No matching available block.")
