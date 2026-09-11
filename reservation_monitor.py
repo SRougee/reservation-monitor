@@ -2,18 +2,16 @@
 DOM Reservation Monitor
 =======================
 
-Browser-only, event-driven Playwright monitor.
+Fast, browser-realistic Playwright monitor.
 
-Design goal:
-- Use only what a normal logged-in browser can see.
-- Do not access Cloudflare, D1, Worker code, Admin Log, or private server APIs.
-- Do not repeatedly poll the DOM from Python.
-- React to browser-visible DOM mutations as soon as they occur.
-- Select all currently available matching cells in one browser-side operation.
-- Continue indefinitely until Ctrl+C.
+The monitor assumes availability is NOT pushed automatically by the website.
+It uses the normal visible "Reload Availability" control, waits for the
+browser-visible grid update, then immediately checks for all available cells.
 
-The website itself is responsible for receiving availability updates and
-changing the DOM. The monitor simply observes those browser-visible changes.
+It does not access Cloudflare, D1, Worker code, Admin Log, or private server
+interfaces. It only interacts with the logged-in reservation page.
+
+The monitor runs continuously until Ctrl+C.
 """
 
 from __future__ import annotations
@@ -34,7 +32,8 @@ URL = "https://reservation-monitor-test.ronaldjennings84.workers.dev/"
 BLOCK_SELECTOR = ".booking-block"
 TARGET_TEXT = ""
 AVAILABLE_CLASS = "available"
-RESERVED_BUTTON_SELECTOR = "#reserveButton"
+RESERVE_BUTTON_SELECTOR = "#reserveButton"
+REFRESH_BUTTON_SELECTOR = "#reloadGrid"
 RESERVATION_MESSAGE_SELECTOR = "#message"
 RESERVATION_SUCCESS_TEXT = "Reserved cells:"
 PAGE_LOAD_TIMEOUT = 10_000
@@ -56,66 +55,65 @@ def log(message: str) -> None:
 
 
 # ============================================================
-# BROWSER-SIDE EVENT MONITORING
+# BROWSER HELPERS
 # ============================================================
 
 
-def install_dom_observer(page) -> None:
-    """Install a browser-side MutationObserver on the reservation grid."""
-    page.evaluate(
-        """
-        () => {
-            window.__rmMutationVersion = 0;
-            window.__rmDomObserver?.disconnect();
-
-            const grid = document.querySelector('#grid');
-            if (!grid) throw new Error('Reservation grid #grid was not found.');
-
-            window.__rmDomObserver = new MutationObserver(() => {
-                window.__rmMutationVersion++;
-            });
-
-            window.__rmDomObserver.observe(grid, {
-                subtree: true,
-                childList: true,
-                attributes: true,
-                attributeFilter: ['class', 'data-cell-id'],
-                characterData: true
-            });
-        }
-        """
-    )
-    log("Browser-side DOM observer installed.")
-
-
-def mutation_version(page) -> int:
+def page_is_alive(page) -> bool:
     try:
-        return int(page.evaluate("() => window.__rmMutationVersion || 0"))
+        return not page.is_closed()
     except Exception:
-        return 0
+        return False
 
 
-def find_available_count(page) -> int:
-    """Fast browser-side count of currently available cells."""
+def grid_signature(page) -> str:
+    """Return a compact browser-side signature of cell state."""
+    return page.locator(BLOCK_SELECTOR).evaluate_all(
+        "elements => elements.map(e => `${e.dataset.cellId}:${e.className}`).join('|')"
+    )
+
+
+def wait_for_grid_update(page, previous_signature: str) -> bool:
+    """Wait for the normal Reload button's DOM update; no fixed sleep."""
     try:
-        locator = page.locator(f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}")
-        count = locator.count()
-        if TARGET_TEXT:
-            return sum(
-                1
-                for index in range(count)
-                if TARGET_TEXT.casefold() in (locator.nth(index).inner_text() or "").casefold()
-            )
-        return count
-    except Exception as exc:
-        log(f"Availability check failed: {exc}")
-        return 0
+        page.wait_for_function(
+            """
+            previous => {
+                const elements = [...document.querySelectorAll('.booking-block')];
+                const current = elements.map(e => `${e.dataset.cellId}:${e.className}`).join('|');
+                return current !== previous;
+            }
+            """,
+            previous_signature,
+            timeout=3_000,
+        )
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
+def find_available_blocks(page):
+    """Find all currently available matching blocks with one browser query."""
+    locator = page.locator(f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}")
+    count = locator.count()
+    result = []
+
+    if TARGET_TEXT:
+        target = TARGET_TEXT.casefold()
+        for index in range(count):
+            block = locator.nth(index)
+            if target in (block.inner_text() or "").casefold():
+                result.append(block)
+    else:
+        for index in range(count):
+            result.append(locator.nth(index))
+
+    return result
 
 
 def select_all_available(page) -> list[int]:
-    """Select every matching available cell in one browser-side operation."""
+    """Select all available matching cells in one browser-side operation."""
     selector = f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}"
-
     try:
         ids = page.locator(selector).evaluate_all(
             """
@@ -126,20 +124,17 @@ def select_all_available(page) -> list[int]:
                 for (const element of elements) {
                     if (target && !element.innerText.toLowerCase().includes(target)) continue;
                     if (!element.classList.contains('available')) continue;
-
-                    // The page's normal click handler performs selection.
                     element.click();
                     selected.push(Number(element.dataset.cellId));
                 }
-
                 return selected;
             }
             """,
             TARGET_TEXT,
         )
-        return [int(value) for value in ids if isinstance(value, (int, float))]
+        return [int(value) for value in ids]
     except Exception as exc:
-        log(f"Could not select available cells in one operation: {exc}")
+        log(f"Could not select all available cells in one operation: {exc}")
         return []
 
 
@@ -153,16 +148,15 @@ def clear_reservation_message(page) -> None:
 
 
 def reserve_selected(page) -> bool:
-    """Click the normal reservation button and wait for a new response event."""
+    """Submit all selected cells and wait for the new browser-visible result."""
     try:
-        button = page.locator(RESERVED_BUTTON_SELECTOR).first
+        button = page.locator(RESERVE_BUTTON_SELECTOR).first
         button.wait_for(state="visible", timeout=2_000)
         clear_reservation_message(page)
 
         log("Submitting all selected cells...")
         button.click()
 
-        # No fixed sleep: wait for the browser-visible result to arrive.
         page.wait_for_function(
             "() => Boolean(document.querySelector('#message')?.textContent?.trim())",
             timeout=3_000,
@@ -184,11 +178,50 @@ def reserve_selected(page) -> bool:
         return False
 
 
-def page_is_alive(page) -> bool:
-    try:
-        return not page.is_closed()
-    except Exception:
+def reload_and_process(page) -> None:
+    """Press the site's normal refresh control and react immediately to its DOM result."""
+    previous_signature = grid_signature(page)
+
+    refresh = page.locator(REFRESH_BUTTON_SELECTOR).first
+    refresh.wait_for(state="visible", timeout=2_000)
+
+    start = time.perf_counter()
+    refresh.click()
+    log("Reload Availability clicked.")
+
+    # The browser itself updates the grid. We wait for that visible change,
+    # rather than sleeping for an arbitrary amount of time.
+    changed = wait_for_grid_update(page, previous_signature)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if changed:
+        log(f"Grid changed after reload ({elapsed_ms:.1f} ms). Checking immediately.")
+    else:
+        log(f"No visible grid change after reload within 3 seconds ({elapsed_ms:.1f} ms).")
+
+
+def process_available(page) -> bool:
+    """Find and reserve every currently available matching cell."""
+    blocks = find_available_blocks(page)
+    if not blocks:
         return False
+
+    ids_preview = []
+    for block in blocks:
+        try:
+            ids_preview.append(int(block.get_attribute("data-cell-id")))
+        except Exception:
+            pass
+
+    log(f"Found {len(blocks)} available matching cell(s): {ids_preview}")
+    selected_ids = select_all_available(page)
+
+    if not selected_ids:
+        log("Available cells were found but none could be selected.")
+        return False
+
+    log(f"Selected ALL {len(selected_ids)} matching cell(s): {selected_ids}")
+    return reserve_selected(page)
 
 
 # ============================================================
@@ -212,12 +245,13 @@ def main() -> None:
     print(f"URL:                 {URL}")
     print(f"Block selector:      {BLOCK_SELECTOR}")
     print(f"Available class:     {AVAILABLE_CLASS}")
-    print(f"Reserve selector:    {RESERVED_BUTTON_SELECTOR}")
-    print("Detection:           Browser DOM MutationObserver")
-    print("Python polling:      DISABLED")
+    print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR}")
+    print(f"Reserve selector:    {RESERVE_BUTTON_SELECTOR}")
+    print("Detection:           Browser-visible DOM change")
     print("Full page reloads:   DISABLED")
     print("Admin/log access:    DISABLED")
     print("Selection:           ALL matching cells in one browser operation")
+    print("Refresh method:      Normal Reload Availability button")
     print("Runtime:             Continuous until Ctrl+C")
     print("=" * 70)
     print()
@@ -260,7 +294,8 @@ def main() -> None:
                     print("=" * 70)
                     print("Log in manually if needed and navigate to the Reservations page.")
                     print("Type Y or YES when ready to start monitoring.")
-                    print("The monitor will then react to browser-visible DOM changes.")
+                    print("The monitor will press the normal Reload Availability button.")
+                    print("It will not reload the whole page.")
                     print("=" * 70)
                     print()
 
@@ -274,45 +309,26 @@ def main() -> None:
                             break
                         print("Waiting. Type Y or YES when ready.")
 
-                    try:
-                        install_dom_observer(page)
-                    except Exception as exc:
-                        log(f"Could not install DOM observer: {exc}")
-                        ready = False
-                        continue
-
-                    log("Monitoring started. No Python polling or artificial scan delay is running.")
+                    log("Monitoring started. Press Ctrl+C to stop.")
 
                 try:
-                    # First handle anything already available when the monitor starts.
-                    available_count = find_available_count(page)
-                    if available_count:
-                        log(f"Detected {available_count} available matching cell(s).")
-                        selected_ids = select_all_available(page)
-                        if selected_ids:
-                            log(f"Selected ALL {len(selected_ids)} matching cell(s): {selected_ids}")
-                            reserve_selected(page)
-                        else:
-                            log("Available cells were detected but could not be selected.")
+                    # Check anything already visible before the first reload.
+                    if process_available(page):
+                        log("Reservation cycle completed.")
+                        continue
 
-                    # From here on, sleep is replaced by a browser-side event wait.
-                    version = mutation_version(page)
-                    log("Waiting for the next browser-visible reservation-grid change...")
+                    # No availability: use the site's normal refresh control.
+                    # There is no artificial polling sleep between refreshes.
+                    reload_and_process(page)
 
-                    page.wait_for_function(
-                        "(previous) => (window.__rmMutationVersion || 0) !== previous",
-                        version,
-                        timeout=30_000,
-                    )
+                    # React immediately to the refreshed DOM.
+                    if process_available(page):
+                        log("Reservation cycle completed.")
 
-                except PlaywrightTimeoutError:
-                    # A timeout here is not an error: it simply means the page
-                    # produced no DOM mutation during this window. Re-arm the
-                    # observer and wait again. No refresh button is clicked.
-                    continue
                 except Exception as exc:
-                    log(f"Monitoring event error: {exc}")
-                    time.sleep(0.2)
+                    log(f"Monitoring cycle error: {exc}")
+                    log("Continuing with the next cycle.")
+                    time.sleep(0.05)
 
         except KeyboardInterrupt:
             print()
