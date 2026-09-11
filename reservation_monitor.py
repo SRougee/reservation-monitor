@@ -30,7 +30,6 @@ from playwright.sync_api import (
 # ============================================================
 
 URL = "https://reservation-monitor-test.ronaldjennings84.workers.dev/"
-LOGIN_TIME_SECONDS = 120
 BLOCK_SELECTOR = ".booking-block"
 TARGET_TEXT = ""
 AVAILABLE_CLASS = "available"
@@ -224,7 +223,6 @@ def main() -> None:
     print("                 DOM RESERVATION MONITOR")
     print("=" * 64)
     print(f"URL:                 {URL}")
-    print(f"Login period:        {LOGIN_TIME_SECONDS} seconds")
     print(f"Cycle target:        {CHECK_INTERVAL:.2f} seconds")
     print(f"Block selector:      {BLOCK_SELECTOR}")
     print(f"Available class:     {AVAILABLE_CLASS or '(disabled)'}")
@@ -257,30 +255,23 @@ def main() -> None:
 
         print()
         print("=" * 64)
-        print("                         LOGIN PERIOD")
+        print("                         LOGIN / READY")
         print("=" * 64)
-        print("Please log in and complete any CAPTCHA manually.")
-        print("Then navigate to the Reservations page.")
-        print()
-        print(f"You have {LOGIN_TIME_SECONDS} seconds.")
+        print("The browser is open.")
+        print("Log in manually if needed, then navigate to the Reservations page.")
+        print("When you are ready for the monitor to start, type Y and press ENTER.")
+        print("You can also type YES. Any other answer will keep waiting.")
         print("=" * 64)
         print()
 
-        login_start = time.monotonic()
         while True:
-            remaining = LOGIN_TIME_SECONDS - (time.monotonic() - login_start)
-            if remaining <= 0:
+            answer = input("Are you ready to start monitoring? [Y/N]: ").strip().lower()
+            if answer in {"y", "yes"}:
                 break
-            print(f"\rTime remaining: {int(remaining):3d} seconds", end="", flush=True)
-            time.sleep(1)
+            print("Monitoring has not started. Type Y or YES when you are ready.")
 
-        print("\n")
-        print("=" * 64)
-        print("                       READY TO START")
-        print("=" * 64)
-        print("Make sure the browser is on the Reservations page.")
-        input("Press ENTER to start monitoring...")
         print()
+        log("Monitoring started.")
 
         cycle = 0
 
