@@ -103,9 +103,11 @@ def matches_target(block) -> bool:
     return TARGET_TEXT.casefold() in block_text(block).casefold()
 
 
-def find_matching_block(page):
+def find_matching_blocks(page):
+    """Return ALL currently available matching blocks, not just the first one."""
     blocks = page.locator(BLOCK_SELECTOR)
     count = blocks.count()
+    matches = []
 
     if DEBUG:
         log(f"Found {count} blocks")
@@ -121,15 +123,15 @@ def find_matching_block(page):
 
             text = block_text(block)
             log(
-                f"MATCH FOUND - block {index + 1}"
+                f"AVAILABLE MATCH - block {index + 1}"
                 + (f": {text[:120]}" if text else "")
             )
-            return block, index
+            matches.append((block, index))
         except Exception as exc:
             if DEBUG:
                 log(f"Could not inspect block {index + 1}: {exc}")
 
-    return None, None
+    return matches
 
 
 def click_reserved(page) -> bool:
@@ -148,8 +150,6 @@ def click_reserved(page) -> bool:
         button.click()
         log("Reserve button clicked. Waiting for the website to confirm success...")
 
-        # A button click alone is not enough to call the reservation successful.
-        # The simulator writes to D1 and then updates #message with the result.
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             text = message.inner_text().strip()
@@ -231,6 +231,7 @@ def main() -> None:
     print(f"White detection:     {USE_WHITE_BACKGROUND}")
     print(f"Reserve selector:    {RESERVED_BUTTON_SELECTOR}")
     print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR or '(full page reload)'}")
+    print("Mode:                Reserve ALL matching available cells")
     print("=" * 64)
     print()
 
@@ -289,31 +290,34 @@ def main() -> None:
             log(f"Cycle {cycle}: checking page...")
 
             try:
-                block, index = find_matching_block(page)
+                matches = find_matching_blocks(page)
 
-                if block is not None:
+                if matches:
                     print()
                     print("=" * 64)
-                    print("                  AVAILABLE BLOCK FOUND")
+                    print("               AVAILABLE BLOCKS FOUND")
                     print("=" * 64)
                     print()
-                    log(f"Block number: {index + 1}")
-                    log("Clicking matching block...")
+                    log(f"Found {len(matches)} matching available cell(s).")
+                    log("Selecting ALL matching available cells...")
 
-                    block.scroll_into_view_if_needed()
-                    block.click()
-                    log("Block clicked.")
+                    for block, index in matches:
+                        block.scroll_into_view_if_needed()
+                        block.click()
+                        log(f"Selected block {index + 1}.")
+
+                    log(f"Selected {len(matches)} cell(s). Clicking Reserve Selected...")
 
                     if click_reserved(page):
                         print()
                         print("=" * 64)
-                        print("                  RESERVATION ACTION COMPLETE")
+                        print("              RESERVATION ACTION COMPLETE")
                         print("=" * 64)
                         print()
-                        log("Website confirmed the reservation was recorded.")
+                        log("Website confirmed all selected reservations were recorded.")
 
                         if KEEP_BROWSER_OPEN_AFTER_SUCCESS:
-                            print("The browser will remain open so you can inspect the reservation.")
+                            print("The browser will remain open so you can inspect the reservations.")
                             input("Press ENTER only when you want to close the browser...")
                         break
 
@@ -323,7 +327,7 @@ def main() -> None:
                     input("Press ENTER to close the browser...")
                     break
 
-                log("No matching available block.")
+                log("No matching available blocks.")
 
             except Exception as exc:
                 log(f"Cycle error: {exc}")
