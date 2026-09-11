@@ -1,7 +1,6 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 const TOKEN_KEY = "rm_session_token";
-const GRID_POLL_MS = 500;
 
 function authHeaders() {
   const token = sessionStorage.getItem(TOKEN_KEY);
@@ -60,7 +59,7 @@ function renderGrid(data) {
     old.delete(cell.id);
   }
   for(const el of old.values()) el.remove();
-  if($("#cycleInfo")) $("#cycleInfo").textContent=`Availability changes every ${data.cycleMs/1000} seconds. White cells remain available until reserved. The grid updates automatically.`;
+  if($("#cycleInfo")) $("#cycleInfo").textContent=`Availability changes every ${data.cycleMs/1000} seconds. White cells remain available until reserved. Press Reload Availability to see new changes.`;
   return data;
 }
 async function loadGrid() {
@@ -70,8 +69,6 @@ async function loadGrid() {
 async function initReservation() {
   const user=await guard(); if(!user)return;
   let refreshing=false;
-  let autoRefreshRunning=true;
-
   const refresh=async(clearMessage=true)=>{
     if(refreshing)return;
     refreshing=true;
@@ -95,18 +92,6 @@ async function initReservation() {
   });
 
   await loadGrid();
-
-  // The real-world simulation is browser-driven: the page's own JavaScript
-  // checks for updated availability and changes the existing DOM in place.
-  // The Python monitor observes those DOM changes rather than clicking
-  // Reload Availability repeatedly.
-  const autoRefresh=async()=>{
-    while(autoRefreshRunning){
-      try { await loadGrid(); } catch {}
-      await new Promise(resolve=>setTimeout(resolve, GRID_POLL_MS));
-    }
-  };
-  autoRefresh();
 }
 async function initAdmin(){
   const user=await guard(); if(!user||user.role!=='admin'){if(user) location.href='/landing.html';return;}
