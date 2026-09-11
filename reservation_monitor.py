@@ -9,7 +9,7 @@ The browser remains visible. Authentication and CAPTCHA are manual:
 the program never attempts to solve or bypass CAPTCHA.
 
 Configure the SETTINGS section below, then run:
-    python reservation_monitor.py
+    py reservation_monitor.py
 """
 
 from __future__ import annotations
@@ -26,42 +26,41 @@ from playwright.sync_api import (
 
 
 # ============================================================
-# SETTINGS - CHANGE THESE
+# SETTINGS
 # ============================================================
 
-URL = "https://YOUR-WEBSITE-HERE.com"
+# Reservation-monitor simulator running on Cloudflare Workers.
+URL = "https://reservation-monitor-test.ronaldjenningss84.workers.dev/"
 
 # Time allowed for manual login, including CAPTCHA, in seconds.
 LOGIN_TIME_SECONDS = 120
 
 # CSS selector matching the repeated availability blocks.
-# Example: ".booking-block" or "div.slot"
-BLOCK_SELECTOR = ".YOUR-BLOCK-SELECTOR"
+BLOCK_SELECTOR = ".booking-block"
 
 # Optional text that must occur inside the target block.
-# Leave empty to accept any available block.
+# Empty means: reserve the first available cell found.
 TARGET_TEXT = ""
 
-# Availability detection. If the website adds a class such as
-# "available", set that class here. Leave empty if not used.
+# Availability detection.
 AVAILABLE_CLASS = "available"
 
-# If availability is represented by a white background, enable this.
-USE_WHITE_BACKGROUND = False
+# The simulator uses a white background for available cells.
+USE_WHITE_BACKGROUND = True
 WHITE_RGB = "rgb(255, 255, 255)"
 
-# Selector for the Reserved button after the block is selected.
-# Examples:
-#   "button:has-text('Reserved')"
-#   "#reserveButton"
-#   "[data-action='reserve']"
-RESERVED_BUTTON_SELECTOR = "button:has-text('Reserved')"
+# Button used to reserve the selected cell.
+RESERVED_BUTTON_SELECTOR = "#reserveButton"
+
+# The simulator deliberately requires an explicit availability refresh.
+# Clicking this button is preferable to a full page reload because it keeps
+# the current tab/session intact while fetching the latest reservation state.
+REFRESH_BUTTON_SELECTOR = "#reloadGrid"
 
 # Target time for one complete monitor cycle.
-# The actual rate is limited by the site's response time.
 CHECK_INTERVAL = 1.0
 
-# Maximum wait for a page navigation/reload.
+# Maximum wait for page navigation/reload.
 PAGE_LOAD_TIMEOUT = 15_000
 
 # Set True while configuring the program to print diagnostic information.
@@ -70,8 +69,7 @@ DEBUG = True
 # Keep the browser open after success so you can inspect the result.
 KEEP_BROWSER_OPEN_AFTER_SUCCESS = True
 
-# Persistent browser profile directory. This allows the browser session/cookies
-# to be retained between runs when the website permits it.
+# Persistent browser profile directory.
 PROFILE_DIR = Path(".browser-profile")
 
 
@@ -161,20 +159,49 @@ def find_matching_block(page):
 
 
 def click_reserved(page) -> bool:
-    log("Looking for Reserved button...")
+    log("Looking for Reserve button...")
 
     try:
         button = page.locator(RESERVED_BUTTON_SELECTOR).first
         button.wait_for(state="visible", timeout=5_000)
-        log("Reserved button found.")
+        log("Reserve button found.")
         button.click()
-        log("Reserved button clicked.")
+        log("Reserve button clicked.")
         return True
     except PlaywrightTimeoutError:
-        log("ERROR: Reserved button did not appear within 5 seconds.")
+        log("ERROR: Reserve button did not appear within 5 seconds.")
         return False
     except Exception as exc:
-        log(f"ERROR clicking Reserved: {exc}")
+        log(f"ERROR clicking Reserve: {exc}")
+        return False
+
+
+def refresh_availability(page) -> bool:
+    """Refresh only the reservation grid when a refresh button is configured."""
+    if REFRESH_BUTTON_SELECTOR:
+        try:
+            button = page.locator(REFRESH_BUTTON_SELECTOR).first
+            button.wait_for(state="visible", timeout=5_000)
+            button.click()
+            return True
+        except PlaywrightTimeoutError:
+            log("ERROR: Refresh Availability button did not appear within 5 seconds.")
+            return False
+        except Exception as exc:
+            log(f"Refresh button error: {exc}")
+            return False
+
+    try:
+        page.reload(
+            wait_until="domcontentloaded",
+            timeout=PAGE_LOAD_TIMEOUT,
+        )
+        return True
+    except PlaywrightTimeoutError:
+        log("Page reload timed out; continuing with current page.")
+        return False
+    except Exception as exc:
+        log(f"Refresh error: {exc}")
         return False
 
 
@@ -210,14 +237,14 @@ def main() -> None:
     print(f"Block selector:      {BLOCK_SELECTOR}")
     print(f"Available class:     {AVAILABLE_CLASS or '(disabled)'}")
     print(f"White detection:     {USE_WHITE_BACKGROUND}")
-    print(f"Reserved selector:   {RESERVED_BUTTON_SELECTOR}")
+    print(f"Reserve selector:    {RESERVED_BUTTON_SELECTOR}")
+    print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR or '(full page reload)'}")
     print("=" * 64)
     print()
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
-        # Persistent context retains cookies/session data where the site allows it.
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
             headless=False,
@@ -244,7 +271,7 @@ def main() -> None:
         print("                         LOGIN PERIOD")
         print("=" * 64)
         print("Please log in and complete any CAPTCHA manually.")
-        print("Then navigate to the exact page you want to monitor.")
+        print("Then navigate to the Reservations page.")
         print()
         print(f"You have {LOGIN_TIME_SECONDS} seconds.")
         print("=" * 64)
@@ -266,7 +293,7 @@ def main() -> None:
         print("=" * 64)
         print("                       READY TO START")
         print("=" * 64)
-        print("Make sure the browser is on the exact page to monitor.")
+        print("Make sure the browser is on the Reservations page.")
         input("Press ENTER to start monitoring...")
         print()
 
@@ -305,7 +332,7 @@ def main() -> None:
                             input("Press ENTER to close the browser...")
                         break
 
-                    log("Reserved button could not be clicked.")
+                    log("Reserve button could not be clicked.")
                     log("Stopping to prevent an unintended action.")
                     break
 
@@ -317,28 +344,18 @@ def main() -> None:
             elapsed = time.monotonic() - cycle_start
             log(f"Cycle completed in {elapsed:.3f} seconds")
 
-            # The next refresh is scheduled so the loop targets approximately
-            # CHECK_INTERVAL seconds per cycle rather than sleeping an extra second.
             wait_time = CHECK_INTERVAL - elapsed
             if wait_time > 0:
                 time.sleep(wait_time)
 
             refresh_start = time.monotonic()
-            log("Refreshing...")
+            log("Refreshing availability...")
 
-            try:
-                page.reload(
-                    wait_until="domcontentloaded",
-                    timeout=PAGE_LOAD_TIMEOUT,
-                )
+            if refresh_availability(page):
                 log(
-                    "Refresh completed in "
+                    "Availability refresh completed in "
                     f"{time.monotonic() - refresh_start:.3f} seconds"
                 )
-            except PlaywrightTimeoutError:
-                log("Page reload timed out; continuing with current page.")
-            except Exception as exc:
-                log(f"Refresh error: {exc}")
 
         context.close()
 
