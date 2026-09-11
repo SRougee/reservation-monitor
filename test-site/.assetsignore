@@ -1,0 +1,6 @@
+# Never expose deployment/configuration files as public static assets
+_assetsignore
+schema.sql
+wrangler.toml
+package.json
+README.md
