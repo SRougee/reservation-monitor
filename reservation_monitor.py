@@ -2,17 +2,18 @@
 DOM Reservation Monitor
 =======================
 
-A configurable Playwright monitor for pages containing repeated
-availability/booking blocks.
+Browser-only, event-driven Playwright monitor.
 
-The browser remains visible. Authentication and CAPTCHA are manual:
-the program never attempts to solve or bypass CAPTCHA.
+Design goal:
+- Use only what a normal logged-in browser can see.
+- Do not access Cloudflare, D1, Worker code, Admin Log, or private server APIs.
+- Do not repeatedly poll the DOM from Python.
+- React to browser-visible DOM mutations as soon as they occur.
+- Select all currently available matching cells in one browser-side operation.
+- Continue indefinitely until Ctrl+C.
 
-The monitor runs continuously until you stop it with Ctrl+C.
-
-IMPORTANT:
-This monitor does not use, read, or query any website admin/log page.
-It only uses the reservation page DOM that is visible to the browser.
+The website itself is responsible for receiving availability updates and
+changing the DOM. The monitor simply observes those browser-visible changes.
 """
 
 from __future__ import annotations
@@ -33,17 +34,9 @@ URL = "https://reservation-monitor-test.ronaldjennings84.workers.dev/"
 BLOCK_SELECTOR = ".booking-block"
 TARGET_TEXT = ""
 AVAILABLE_CLASS = "available"
-USE_WHITE_BACKGROUND = True
-WHITE_RGB = "rgb(255, 255, 255)"
 RESERVED_BUTTON_SELECTOR = "#reserveButton"
-REFRESH_BUTTON_SELECTOR = "#reloadGrid"
 RESERVATION_MESSAGE_SELECTOR = "#message"
 RESERVATION_SUCCESS_TEXT = "Reserved cells:"
-
-# Scan the DOM very frequently. The simulator only creates new availability
-# every 30 seconds, so the refresh itself is kept separate from the scan.
-CHECK_INTERVAL = 0.10
-REFRESH_INTERVAL = 0.50
 PAGE_LOAD_TIMEOUT = 10_000
 DEBUG = True
 PROFILE_DIR = Path(".browser-profile")
@@ -63,177 +56,136 @@ def log(message: str) -> None:
 
 
 # ============================================================
-# DOM HELPERS
+# BROWSER-SIDE EVENT MONITORING
 # ============================================================
 
 
-def block_text(block) -> str:
+def install_dom_observer(page) -> None:
+    """Install a browser-side MutationObserver on the reservation grid."""
+    page.evaluate(
+        """
+        () => {
+            window.__rmMutationVersion = 0;
+            window.__rmDomObserver?.disconnect();
+
+            const grid = document.querySelector('#grid');
+            if (!grid) throw new Error('Reservation grid #grid was not found.');
+
+            window.__rmDomObserver = new MutationObserver(() => {
+                window.__rmMutationVersion++;
+            });
+
+            window.__rmDomObserver.observe(grid, {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['class', 'data-cell-id'],
+                characterData: true
+            });
+        }
+        """
+    )
+    log("Browser-side DOM observer installed.")
+
+
+def mutation_version(page) -> int:
     try:
-        return block.inner_text(timeout=500).strip()
+        return int(page.evaluate("() => window.__rmMutationVersion || 0"))
     except Exception:
-        return ""
+        return 0
 
 
-def is_white_background(block) -> bool:
+def find_available_count(page) -> int:
+    """Fast browser-side count of currently available cells."""
     try:
-        colour = block.evaluate("element => getComputedStyle(element).backgroundColor")
-        return colour == WHITE_RGB
-    except Exception:
-        return False
-
-
-def is_available(block) -> bool:
-    try:
-        classes = (block.get_attribute("class") or "").split()
-        if AVAILABLE_CLASS in classes:
-            return True
-    except Exception:
-        pass
-
-    if USE_WHITE_BACKGROUND and is_white_background(block):
-        return True
-
-    return False
-
-
-def matches_target(block) -> bool:
-    if not TARGET_TEXT:
-        return True
-    return TARGET_TEXT.casefold() in block_text(block).casefold()
-
-
-def find_matching_blocks(page):
-    """Return every currently available matching block, using a fast CSS query first."""
-    matches = []
-
-    # Fast path: the simulator marks available cells with the `available`
-    # class. This avoids inspecting all 40 cells on every 0.1s scan.
-    try:
-        fast_locator = page.locator(f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}")
-        fast_count = fast_locator.count()
-        for index in range(fast_count):
-            try:
-                block = fast_locator.nth(index)
-                if not matches_target(block):
-                    continue
-                text = block_text(block)
-                log(
-                    f"AVAILABLE MATCH - block {index + 1}"
-                    + (f": {text[:120]}" if text else "")
-                )
-                matches.append((block, index))
-            except Exception as exc:
-                log(f"Could not inspect available block {index + 1}: {exc}")
-        if fast_count:
-            return matches
+        locator = page.locator(f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}")
+        count = locator.count()
+        if TARGET_TEXT:
+            return sum(
+                1
+                for index in range(count)
+                if TARGET_TEXT.casefold() in (locator.nth(index).inner_text() or "").casefold()
+            )
+        return count
     except Exception as exc:
-        log(f"Fast availability scan failed: {exc}; using fallback scan.")
+        log(f"Availability check failed: {exc}")
+        return 0
 
-    # Fallback for pages where availability is represented only by a white
-    # background rather than the availability class.
+
+def select_all_available(page) -> list[int]:
+    """Select every matching available cell in one browser-side operation."""
+    selector = f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}"
+
     try:
-        blocks = page.locator(BLOCK_SELECTOR)
-        count = blocks.count()
-        if DEBUG:
-            log(f"Fallback scan found {count} blocks")
+        ids = page.locator(selector).evaluate_all(
+            """
+            (elements, targetText) => {
+                const target = String(targetText || '').toLowerCase();
+                const selected = [];
 
-        for index in range(count):
-            try:
-                block = blocks.nth(index)
-                if not is_available(block) or not matches_target(block):
-                    continue
-                text = block_text(block)
-                log(
-                    f"AVAILABLE MATCH - block {index + 1}"
-                    + (f": {text[:120]}" if text else "")
-                )
-                matches.append((block, index))
-            except Exception as exc:
-                log(f"Could not inspect block {index + 1}: {exc}")
+                for (const element of elements) {
+                    if (target && !element.innerText.toLowerCase().includes(target)) continue;
+                    if (!element.classList.contains('available')) continue;
+
+                    // The page's normal click handler performs selection.
+                    element.click();
+                    selected.push(Number(element.dataset.cellId));
+                }
+
+                return selected;
+            }
+            """,
+            TARGET_TEXT,
+        )
+        return [int(value) for value in ids if isinstance(value, (int, float))]
     except Exception as exc:
-        log(f"Fallback availability scan failed: {exc}")
-
-    return matches
-
-
-def get_reservation_message(page) -> str:
-    """Read only the reservation page's normal user-facing response."""
-    try:
-        return page.locator(RESERVATION_MESSAGE_SELECTOR).inner_text(timeout=500).strip()
-    except Exception:
-        return ""
+        log(f"Could not select available cells in one operation: {exc}")
+        return []
 
 
 def clear_reservation_message(page) -> None:
-    """Clear a previous response so an old success cannot be mistaken for a new one."""
     try:
         page.locator(RESERVATION_MESSAGE_SELECTOR).evaluate(
             "element => { element.textContent = ''; }"
         )
     except Exception:
-        # Clearing is a convenience for the simulator. The actual reservation
-        # result is still verified from the response after the click.
         pass
 
 
-def click_reserved(page) -> bool:
-    """Click Reserve Selected and verify the new page response."""
-    log("Looking for Reserve button...")
-
+def reserve_selected(page) -> bool:
+    """Click the normal reservation button and wait for a new response event."""
     try:
         button = page.locator(RESERVED_BUTTON_SELECTOR).first
         button.wait_for(state="visible", timeout=2_000)
-        log("Reserve button found.")
-
-        # Remove the previous message before the new reservation attempt.
         clear_reservation_message(page)
 
+        log("Submitting all selected cells...")
         button.click()
-        log("Reserve button clicked. Waiting for website confirmation...")
 
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            text = get_reservation_message(page)
+        # No fixed sleep: wait for the browser-visible result to arrive.
+        page.wait_for_function(
+            "() => Boolean(document.querySelector('#message')?.textContent?.trim())",
+            timeout=3_000,
+        )
 
-            if text.startswith(RESERVATION_SUCCESS_TEXT):
-                log(f"Website confirmed reservation: {text}")
-                return True
+        text = page.locator(RESERVATION_MESSAGE_SELECTOR).inner_text(timeout=500).strip()
+        if text.startswith(RESERVATION_SUCCESS_TEXT):
+            log(f"Website confirmed reservation: {text}")
+            return True
 
-            if text:
-                log(f"Website reservation response: {text}")
-                return False
-
-            time.sleep(0.01)
-
-        log("ERROR: No reservation confirmation received within 3 seconds.")
+        log(f"Website reservation response: {text or 'no readable response'}")
         return False
 
     except PlaywrightTimeoutError:
-        log("ERROR: Reserve button did not appear within 2 seconds.")
+        log("ERROR: No reservation response received within 3 seconds.")
         return False
     except Exception as exc:
-        log(f"ERROR clicking Reserve: {exc}")
-        return False
-
-
-def refresh_availability(page) -> bool:
-    """Refresh availability without navigating away from the page."""
-    try:
-        button = page.locator(REFRESH_BUTTON_SELECTOR).first
-        button.wait_for(state="visible", timeout=2_000)
-        button.click()
-        return True
-    except PlaywrightTimeoutError:
-        log("Refresh button not available; will retry on the next cycle.")
-        return False
-    except Exception as exc:
-        log(f"Refresh error: {exc}; will retry on the next cycle.")
+        log(f"ERROR submitting reservation: {exc}")
         return False
 
 
 def page_is_alive(page) -> bool:
     try:
-        _ = page.url
         return not page.is_closed()
     except Exception:
         return False
@@ -248,36 +200,26 @@ def validate_settings() -> None:
     if "YOUR-WEBSITE-HERE" in URL:
         print("ERROR: Change URL in the SETTINGS section.")
         sys.exit(1)
-    if "YOUR-BLOCK-SELECTOR" in BLOCK_SELECTOR:
-        print("ERROR: Change BLOCK_SELECTOR in the SETTINGS section.")
-        sys.exit(1)
-    if CHECK_INTERVAL <= 0:
-        print("ERROR: CHECK_INTERVAL must be greater than zero.")
-        sys.exit(1)
-    if REFRESH_INTERVAL <= 0:
-        print("ERROR: REFRESH_INTERVAL must be greater than zero.")
-        sys.exit(1)
 
 
 def main() -> None:
     validate_settings()
 
     print()
-    print("=" * 64)
+    print("=" * 70)
     print("                 DOM RESERVATION MONITOR")
-    print("=" * 64)
+    print("=" * 70)
     print(f"URL:                 {URL}")
-    print(f"DOM scan target:     {CHECK_INTERVAL:.2f} seconds")
-    print(f"Grid refresh target: {REFRESH_INTERVAL:.2f} seconds")
     print(f"Block selector:      {BLOCK_SELECTOR}")
-    print(f"Available class:     {AVAILABLE_CLASS or '(disabled)'}")
-    print(f"White detection:     {USE_WHITE_BACKGROUND}")
+    print(f"Available class:     {AVAILABLE_CLASS}")
     print(f"Reserve selector:    {RESERVED_BUTTON_SELECTOR}")
-    print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR}")
-    print("Log/admin access:    DISABLED")
-    print("Mode:                Reserve ALL matching available cells")
+    print("Detection:           Browser DOM MutationObserver")
+    print("Python polling:      DISABLED")
+    print("Full page reloads:   DISABLED")
+    print("Admin/log access:    DISABLED")
+    print("Selection:           ALL matching cells in one browser operation")
     print("Runtime:             Continuous until Ctrl+C")
-    print("=" * 64)
+    print("=" * 70)
     print()
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,28 +236,18 @@ def main() -> None:
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(2_000)
             ready = False
-            last_refresh = 0.0
 
             while True:
                 if not page_is_alive(page):
                     log("Browser page is unavailable. Attempting recovery...")
-                    try:
-                        page = context.new_page()
-                        page.set_default_timeout(2_000)
-                        ready = False
-                    except Exception as exc:
-                        log(f"Could not create recovery page: {exc}")
-                        time.sleep(1)
-                        continue
+                    page = context.new_page()
+                    page.set_default_timeout(2_000)
+                    ready = False
 
                 try:
                     if page.url == "about:blank":
                         log("Opening website...")
-                        page.goto(
-                            URL,
-                            wait_until="domcontentloaded",
-                            timeout=PAGE_LOAD_TIMEOUT,
-                        )
+                        page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                 except Exception as exc:
                     log(f"Could not open/navigate page: {exc}")
                     time.sleep(1)
@@ -323,14 +255,13 @@ def main() -> None:
 
                 if not ready:
                     print()
-                    print("=" * 64)
+                    print("=" * 70)
                     print("                         LOGIN / READY")
-                    print("=" * 64)
-                    print("The browser is open.")
-                    print("Log in manually if needed, then navigate to the Reservations page.")
-                    print("Type Y or YES when you are ready to start monitoring.")
-                    print("The monitor will then run continuously until Ctrl+C.")
-                    print("=" * 64)
+                    print("=" * 70)
+                    print("Log in manually if needed and navigate to the Reservations page.")
+                    print("Type Y or YES when ready to start monitoring.")
+                    print("The monitor will then react to browser-visible DOM changes.")
+                    print("=" * 70)
                     print()
 
                     while True:
@@ -341,81 +272,58 @@ def main() -> None:
                         if answer in {"y", "yes"}:
                             ready = True
                             break
-                        print("Waiting. Type Y or YES when you are ready.")
+                        print("Waiting. Type Y or YES when ready.")
 
-                    last_refresh = 0.0
-                    log("Monitoring started. Press Ctrl+C to stop.")
+                    try:
+                        install_dom_observer(page)
+                    except Exception as exc:
+                        log(f"Could not install DOM observer: {exc}")
+                        ready = False
+                        continue
 
-                cycle_start = time.monotonic()
+                    log("Monitoring started. No Python polling or artificial scan delay is running.")
 
                 try:
-                    log("Checking page...")
-                    matches = find_matching_blocks(page)
-
-                    if matches:
-                        print()
-                        print("=" * 64)
-                        print("               AVAILABLE BLOCKS FOUND")
-                        print("=" * 64)
-                        print()
-                        log(f"Found {len(matches)} matching available cell(s).")
-                        log("Selecting ALL matching available cells...")
-
-                        selected = 0
-                        for block, index in matches:
-                            try:
-                                block.click()
-                                selected += 1
-                                log(f"Selected block {index + 1}.")
-                            except Exception as exc:
-                                log(f"Could not select block {index + 1}: {exc}; continuing with other cells.")
-
-                        if selected:
-                            log(f"Selected {selected} cell(s). Clicking Reserve Selected...")
-
-                            if click_reserved(page):
-                                log("Reservation confirmed by website.")
-                            else:
-                                log("Reservation was not confirmed. Continuing to monitor.")
+                    # First handle anything already available when the monitor starts.
+                    available_count = find_available_count(page)
+                    if available_count:
+                        log(f"Detected {available_count} available matching cell(s).")
+                        selected_ids = select_all_available(page)
+                        if selected_ids:
+                            log(f"Selected ALL {len(selected_ids)} matching cell(s): {selected_ids}")
+                            reserve_selected(page)
                         else:
-                            log("No cells could be selected. Continuing to monitor.")
-                    else:
-                        log("No matching available blocks.")
+                            log("Available cells were detected but could not be selected.")
 
+                    # From here on, sleep is replaced by a browser-side event wait.
+                    version = mutation_version(page)
+                    log("Waiting for the next browser-visible reservation-grid change...")
+
+                    page.wait_for_function(
+                        "(previous) => (window.__rmMutationVersion || 0) !== previous",
+                        version,
+                        timeout=30_000,
+                    )
+
+                except PlaywrightTimeoutError:
+                    # A timeout here is not an error: it simply means the page
+                    # produced no DOM mutation during this window. Re-arm the
+                    # observer and wait again. No refresh button is clicked.
+                    continue
                 except Exception as exc:
-                    log(f"Monitoring cycle error: {exc}")
-                    log("The monitor will continue with the next cycle.")
-
-                elapsed = time.monotonic() - cycle_start
-                wait_time = max(0.0, CHECK_INTERVAL - elapsed)
-                if wait_time:
-                    time.sleep(wait_time)
-
-                # Refresh the grid independently of the DOM scan. This keeps
-                # the scanner fast without hammering the site's state API on
-                # every 0.1-second scan.
-                now = time.monotonic()
-                if now - last_refresh >= REFRESH_INTERVAL:
-                    try:
-                        log("Refreshing availability...")
-                        if refresh_availability(page):
-                            last_refresh = time.monotonic()
-                            log("Availability refresh completed.")
-                    except Exception as exc:
-                        log(f"Refresh cycle error: {exc}; continuing.")
+                    log(f"Monitoring event error: {exc}")
+                    time.sleep(0.2)
 
         except KeyboardInterrupt:
             print()
-            print("=" * 64)
+            print("=" * 70)
             print("                    MONITOR STOPPED")
-            print("=" * 64)
+            print("=" * 70)
             print("Ctrl+C received. Closing the monitor cleanly.")
-            print("The browser will now close.")
-            print("=" * 64)
+            print("=" * 70)
 
         except Exception as exc:
             log(f"Unexpected top-level error: {exc}")
-            log("Monitor encountered an unexpected problem.")
 
         finally:
             if context is not None:
