@@ -30,7 +30,7 @@ from playwright.sync_api import (
 # ============================================================
 
 # Reservation-monitor simulator running on Cloudflare Workers.
-URL = "https://reservation-monitor-test.ronaldjenningss84.workers.dev/"
+URL = "https://reservation-monitor-test.ronaldjennings84.workers.dev/"
 
 # Time allowed for manual login, including CAPTCHA, in seconds.
 LOGIN_TIME_SECONDS = 120
@@ -53,8 +53,7 @@ WHITE_RGB = "rgb(255, 255, 255)"
 RESERVED_BUTTON_SELECTOR = "#reserveButton"
 
 # The simulator deliberately requires an explicit availability refresh.
-# Clicking this button is preferable to a full page reload because it keeps
-# the current tab/session intact while fetching the latest reservation state.
+# Clicking this button keeps the current tab/session intact.
 REFRESH_BUTTON_SELECTOR = "#reloadGrid"
 
 # Target time for one complete monitor cycle.
