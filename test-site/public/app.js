@@ -56,21 +56,26 @@ async function initReservation() {
     catch(e){$("#message").textContent=e.message;}
   });
   await loadGrid();
-  // Intentionally no automatic polling here. Availability changes are only fetched when
-  // the user presses Reload Availability, except that a successful reservation refreshes
-  // the grid immediately so the reserved cells turn grey.
+  // No automatic polling. Availability changes are fetched only by Reload Availability,
+  // except that a successful reservation refreshes the grid immediately.
 }
 async function initAdmin(){
   const user=await guard(); if(!user||user.role!=='admin'){if(user) location.href='/landing.html';return;}
   async function action(action, cellId){try{await api('/api/admin',{method:'POST',body:JSON.stringify({action,cellId})});await loadAdmin();}catch(e){$("#adminMessage").textContent=e.message;}}
   $("#reset").onclick=()=>action('reset'); $("#openRandom").onclick=()=>action('open_random'); $("#clearLog").onclick=()=>action('clear_log');
   $("#openCell").onclick=()=>action('open_cell',Number($("#cellNumber").value)); $("#closeCell").onclick=()=>action('close_cell',Number($("#cellNumber").value));
-  async function loadAdmin(){
+  async function loadLog(){
     const data=await api('/api/log');
     $("#logBody").innerHTML=data.reservations.map(r=>`<tr><td>${r.cell_id}</td><td>${r.username}</td><td>${new Date(r.opened_at).toLocaleString()}</td><td>${new Date(r.reserved_at).toLocaleString()}</td><td>${Number(r.open_seconds).toFixed(2)} sec</td></tr>`).join('') || '<tr><td colspan="5">No reservations yet.</td></tr>';
+  }
+  async function loadAdmin(){
+    await loadLog();
     await loadGrid();
   }
-  await loadAdmin(); setInterval(loadAdmin,3000);
+  await loadAdmin();
+  // Keep the reservation log current, but do not automatically refresh the cell grid.
+  // The grid changes only on initial load, an admin action, or an explicit user reload.
+  setInterval(async()=>{try{await loadLog();}catch{}},3000);
 }
 async function initStandardPage(){ if($("#loginForm")||$("#reservationPage")||$("#adminPage"))return; await guard(); }
 
