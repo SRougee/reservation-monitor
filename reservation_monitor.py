@@ -2,11 +2,13 @@
 DOM Reservation Monitor
 =======================
 
-Playwright-based reservation monitor for the test simulator.
+A configurable Playwright monitor for pages containing repeated
+availability/booking blocks.
 
-The browser stays visible and login is always manual. The monitor is
-intentionally defensive: transient DOM, refresh, or network errors are
-caught and the monitoring loop continues instead of terminating.
+The browser remains visible. Authentication and CAPTCHA are manual:
+the program never attempts to solve or bypass CAPTCHA.
+
+The monitor runs continuously until you stop it with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -16,8 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 # ============================================================
@@ -37,12 +38,7 @@ RESERVATION_SUCCESS_TEXT = "Reserved cells:"
 CHECK_INTERVAL = 1.0
 PAGE_LOAD_TIMEOUT = 15_000
 DEBUG = True
-KEEP_BROWSER_OPEN_AFTER_SUCCESS = True
 PROFILE_DIR = Path(".browser-profile")
-
-# Recovery settings.
-ERROR_RETRY_DELAY = 2.0
-REFRESH_RETRY_DELAY = 2.0
 
 
 # ============================================================
@@ -72,9 +68,7 @@ def block_text(block) -> str:
 
 def is_white_background(block) -> bool:
     try:
-        colour = block.evaluate(
-            "element => getComputedStyle(element).backgroundColor"
-        )
+        colour = block.evaluate("element => getComputedStyle(element).backgroundColor")
         return colour == WHITE_RGB
     except Exception:
         return False
@@ -82,16 +76,14 @@ def is_white_background(block) -> bool:
 
 def is_available(block) -> bool:
     try:
-        if AVAILABLE_CLASS:
-            classes = (block.get_attribute("class") or "").split()
-            if AVAILABLE_CLASS in classes:
-                return True
-
-        if USE_WHITE_BACKGROUND and is_white_background(block):
+        classes = (block.get_attribute("class") or "").split()
+        if AVAILABLE_CLASS in classes:
             return True
-    except Exception as exc:
-        if DEBUG:
-            log(f"Availability check failed: {exc}")
+    except Exception:
+        pass
+
+    if USE_WHITE_BACKGROUND and is_white_background(block):
+        return True
 
     return False
 
@@ -99,21 +91,13 @@ def is_available(block) -> bool:
 def matches_target(block) -> bool:
     if not TARGET_TEXT:
         return True
-    try:
-        return TARGET_TEXT.casefold() in block_text(block).casefold()
-    except Exception:
-        return False
+    return TARGET_TEXT.casefold() in block_text(block).casefold()
 
 
 def find_matching_blocks(page):
     """Return every currently available matching block."""
-    try:
-        blocks = page.locator(BLOCK_SELECTOR)
-        count = blocks.count()
-    except Exception as exc:
-        log(f"Could not read reservation blocks: {exc}")
-        return []
-
+    blocks = page.locator(BLOCK_SELECTOR)
+    count = blocks.count()
     matches = []
 
     if DEBUG:
@@ -134,143 +118,93 @@ def find_matching_blocks(page):
             )
             matches.append((block, index))
         except Exception as exc:
-            # One bad DOM element must never kill the whole monitoring cycle.
             log(f"Could not inspect block {index + 1}: {exc}")
 
     return matches
 
 
-def select_blocks(matches) -> list[int]:
-    """Select all matches; skip individual cells that fail to click."""
-    selected = []
-
-    for block, index in matches:
-        try:
-            block.scroll_into_view_if_needed(timeout=3_000)
-            block.click(timeout=3_000)
-            selected.append(index + 1)
-            log(f"Selected block {index + 1}.")
-        except Exception as exc:
-            log(f"Could not select block {index + 1}: {exc}")
-
-    return selected
+def get_reservation_message(page) -> str:
+    try:
+        return page.locator(RESERVATION_MESSAGE_SELECTOR).inner_text().strip()
+    except Exception:
+        return ""
 
 
-def click_reserved(page) -> tuple[bool, str]:
-    """Click Reserve Selected and wait for a definite website response."""
+def click_reserved(page) -> bool:
+    """Click Reserve Selected and verify the site's response."""
     log("Looking for Reserve button...")
 
     try:
         button = page.locator(RESERVED_BUTTON_SELECTOR).first
         button.wait_for(state="visible", timeout=5_000)
-
-        message = page.locator(RESERVATION_MESSAGE_SELECTOR)
-        message_text_before = message.inner_text().strip()
-
         log("Reserve button found.")
+
+        before = get_reservation_message(page)
+        if DEBUG and before:
+            log(f"Reservation message before click: {before}")
+
         button.click()
         log("Reserve button clicked. Waiting for website confirmation...")
 
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            try:
-                text = message.inner_text().strip()
-            except Exception:
-                text = ""
+            text = get_reservation_message(page)
 
             if text.startswith(RESERVATION_SUCCESS_TEXT):
                 log(f"Website confirmed reservation: {text}")
-                return True, text
+                return True
 
-            if text and text != message_text_before:
+            if text and text != before:
                 log(f"Website reservation response: {text}")
-                return False, text
+                return False
 
             time.sleep(0.1)
 
-        # The click happened, but we received no response. Do NOT blindly
-        # click again because the server may have accepted the first request.
-        log("WARNING: Reserve was clicked but no confirmation was received.")
-        return False, "unknown"
-
-    except PlaywrightTimeoutError:
-        log("WARNING: Reserve button did not appear within 5 seconds.")
-        return False, "button-timeout"
-    except Exception as exc:
-        log(f"WARNING: Reserve action encountered an error: {exc}")
-        return False, "exception"
-
-
-def verify_cells_no_longer_available(page, cell_ids: list[int]) -> bool:
-    """For the simulator, check whether selected cells changed to unavailable."""
-    if not cell_ids:
+        log("ERROR: No reservation confirmation received within 5 seconds.")
         return False
 
-    try:
-        result = page.evaluate(
-            """
-            async (ids) => {
-                const token = sessionStorage.getItem('rm_session_token');
-                const response = await fetch('/api/state', {
-                    headers: token ? { Authorization: `Bearer ${token}` } : {}
-                });
-                if (!response.ok) return null;
-                const data = await response.json();
-                return data.cells
-                    .filter(c => ids.includes(Number(c.id)))
-                    .map(c => ({id: Number(c.id), status: c.status}));
-            }
-            """,
-            cell_ids,
-        )
-
-        if not result or len(result) != len(cell_ids):
-            return False
-
-        unavailable = all(cell["status"] != "available" for cell in result)
-        if unavailable:
-            log(
-                "The selected cells are no longer available. "
-                "The reservation request may have succeeded despite the missing response."
-            )
-        return unavailable
+    except PlaywrightTimeoutError:
+        log("ERROR: Reserve button did not appear within 5 seconds.")
+        return False
     except Exception as exc:
-        if DEBUG:
-            log(f"Could not verify cell state after uncertain reservation: {exc}")
+        log(f"ERROR clicking Reserve: {exc}")
         return False
 
 
 def refresh_availability(page) -> bool:
-    """Refresh availability without killing the monitoring loop."""
+    """Refresh availability without navigating away from the page."""
     try:
-        if REFRESH_BUTTON_SELECTOR:
-            button = page.locator(REFRESH_BUTTON_SELECTOR).first
-            button.wait_for(state="visible", timeout=5_000)
-            button.click(timeout=5_000)
-            return True
-
-        page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+        button = page.locator(REFRESH_BUTTON_SELECTOR).first
+        button.wait_for(state="visible", timeout=5_000)
+        button.click()
         return True
-
-    except PlaywrightTimeoutError as exc:
-        log(f"Refresh timed out; monitoring will continue: {exc}")
+    except PlaywrightTimeoutError:
+        log("Refresh button not available; will retry on the next cycle.")
+        return False
     except Exception as exc:
-        log(f"Refresh failed; monitoring will continue: {exc}")
+        log(f"Refresh error: {exc}; will retry on the next cycle.")
+        return False
 
-    return False
+
+def page_is_alive(page) -> bool:
+    try:
+        _ = page.url
+        return not page.is_closed()
+    except Exception:
+        return False
 
 
 # ============================================================
-# STARTUP / MAIN
+# MAIN
 # ============================================================
 
 
 def validate_settings() -> None:
     if "YOUR-WEBSITE-HERE" in URL:
-        print("ERROR: URL has not been configured.")
+        print("ERROR: Change URL in the SETTINGS section.")
         sys.exit(1)
     if "YOUR-BLOCK-SELECTOR" in BLOCK_SELECTOR:
-        print("ERROR: BLOCK_SELECTOR has not been configured.")
+        print("ERROR: Change BLOCK_SELECTOR in the SETTINGS section.")
         sys.exit(1)
     if CHECK_INTERVAL <= 0:
         print("ERROR: CHECK_INTERVAL must be greater than zero.")
@@ -290,70 +224,88 @@ def main() -> None:
     print(f"Available class:     {AVAILABLE_CLASS or '(disabled)'}")
     print(f"White detection:     {USE_WHITE_BACKGROUND}")
     print(f"Reserve selector:    {RESERVED_BUTTON_SELECTOR}")
-    print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR or '(full page reload)'}")
+    print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR}")
     print("Mode:                Reserve ALL matching available cells")
-    print("Recovery:             Errors are caught and monitoring continues")
+    print("Runtime:             Continuous until Ctrl+C")
     print("=" * 64)
     print()
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
+        context = None
+
         try:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
                 headless=False,
                 viewport={"width": 1400, "height": 900},
             )
-        except Exception as exc:
-            log(f"Could not start Chromium: {exc}")
-            return
-
-        try:
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(5_000)
 
-            try:
-                log("Opening website...")
-                page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-            except Exception as exc:
-                log(f"Could not open website: {exc}")
-                log("The browser will remain open so you can inspect it.")
-                input("Press ENTER to close the browser...")
-                return
-
-            print()
-            print("=" * 64)
-            print("                         LOGIN / READY")
-            print("=" * 64)
-            print("The browser is open.")
-            print("Log in manually if needed, then navigate to the Reservations page.")
-            print("When you are ready for the monitor to start, type Y and press ENTER.")
-            print("You can also type YES. Any other answer will keep waiting.")
-            print("=" * 64)
-            print()
-
             while True:
+                # ----------------------------------------------------
+                # Initial page / recovery if the page is unavailable
+                # ----------------------------------------------------
+                if not page_is_alive(page):
+                    log("Browser page is unavailable. Attempting recovery...")
+                    try:
+                        page = context.new_page()
+                        page.set_default_timeout(5_000)
+                    except Exception as exc:
+                        log(f"Could not create recovery page: {exc}")
+                        time.sleep(2)
+                        continue
+
                 try:
-                    answer = input("Are you ready to start monitoring? [Y/N]: ").strip().casefold()
-                except (EOFError, KeyboardInterrupt):
+                    if page.url == "about:blank":
+                        log("Opening website...")
+                        page.goto(
+                            URL,
+                            wait_until="domcontentloaded",
+                            timeout=PAGE_LOAD_TIMEOUT,
+                        )
+                except Exception as exc:
+                    log(f"Could not open/navigate page: {exc}")
+                    time.sleep(3)
+                    continue
+
+                # ----------------------------------------------------
+                # Manual login / readiness happens once per run.
+                # ----------------------------------------------------
+                if not getattr(main, "ready", False):
                     print()
-                    log("Input interrupted. Browser will remain open.")
-                    return
+                    print("=" * 64)
+                    print("                         LOGIN / READY")
+                    print("=" * 64)
+                    print("The browser is open.")
+                    print("Log in manually if needed, then navigate to the Reservations page.")
+                    print("Type Y or YES when you are ready to start monitoring.")
+                    print("The monitor will then run continuously until Ctrl+C.")
+                    print("=" * 64)
+                    print()
 
-                if answer in {"y", "yes"}:
-                    break
-                print("Waiting. Type Y or YES when you are ready.")
+                    while True:
+                        try:
+                            answer = input("Are you ready to start monitoring? [Y/N]: ").strip().casefold()
+                        except EOFError:
+                            answer = ""
+                        if answer in {"y", "yes"}:
+                            main.ready = True
+                            break
+                        print("Waiting. Type Y or YES when you are ready.")
 
-            log("Monitoring started.")
-            cycle = 0
+                    log("Monitoring started. Press Ctrl+C to stop.")
 
-            while True:
-                cycle += 1
+                # ----------------------------------------------------
+                # One protected monitoring cycle.
+                # Nothing in here should terminate the monitor.
+                # ----------------------------------------------------
                 cycle_start = time.monotonic()
 
                 try:
-                    log(f"Cycle {cycle}: checking page...")
+                    log("Checking page...")
                     matches = find_matching_blocks(page)
 
                     if matches:
@@ -362,99 +314,71 @@ def main() -> None:
                         print("               AVAILABLE BLOCKS FOUND")
                         print("=" * 64)
                         print()
-
                         log(f"Found {len(matches)} matching available cell(s).")
                         log("Selecting ALL matching available cells...")
-                        selected_ids = select_blocks(matches)
 
-                        if not selected_ids:
-                            log("No cells could be selected. Continuing monitoring.")
+                        selected = 0
+                        for block, index in matches:
+                            try:
+                                block.scroll_into_view_if_needed()
+                                block.click()
+                                selected += 1
+                                log(f"Selected block {index + 1}.")
+                            except Exception as exc:
+                                log(f"Could not select block {index + 1}: {exc}; continuing with other cells.")
+
+                        if selected:
+                            log(f"Selected {selected} cell(s). Clicking Reserve Selected...")
+
+                            if click_reserved(page):
+                                log("Reservation confirmed by website.")
+                            else:
+                                log("Reservation was not confirmed. Continuing to monitor.")
                         else:
-                            log(
-                                f"Selected {len(selected_ids)} cell(s): "
-                                f"{', '.join(map(str, selected_ids))}"
-                            )
-                            log("Clicking Reserve Selected...")
+                            log("No cells could be selected. Continuing to monitor.")
+                    else:
+                        log("No matching available blocks.")
 
-                            success, response = click_reserved(page)
-
-                            if success:
-                                print()
-                                print("=" * 64)
-                                print("              RESERVATION ACTION COMPLETE")
-                                print("=" * 64)
-                                print()
-                                log("Website confirmed all selected reservations were recorded.")
-
-                                if KEEP_BROWSER_OPEN_AFTER_SUCCESS:
-                                    print("The browser will remain open so you can inspect the reservations.")
-                                    try:
-                                        input("Press ENTER only when you want to close the browser...")
-                                    except (EOFError, KeyboardInterrupt):
-                                        pass
-                                return
-
-                            if response == "unknown":
-                                # Avoid a duplicate click if the first request actually
-                                # reached the Worker but its response was lost.
-                                if verify_cells_no_longer_available(page, selected_ids):
-                                    log("Treating the uncertain request as completed; continuing safely.")
-                                    if KEEP_BROWSER_OPEN_AFTER_SUCCESS:
-                                        print("The browser will remain open so you can inspect the reservations.")
-                                        try:
-                                            input("Press ENTER only when you want to close the browser...")
-                                        except (EOFError, KeyboardInterrupt):
-                                            pass
-                                    return
-
-                            # A definite failure or an uncertain result where the
-                            # selected cells are still available. Clear the selection
-                            # through a grid refresh and continue instead of killing
-                            # the whole program.
-                            log("Reservation was not confirmed. Refreshing and continuing monitoring.")
-
-                except PlaywrightTimeoutError as exc:
-                    log(f"Transient Playwright timeout: {exc}")
-                    log("Monitoring continues after a short retry delay.")
                 except Exception as exc:
-                    # This is the main safety net: unexpected cycle errors must not
-                    # terminate the monitor.
-                    log(f"Unexpected cycle error: {exc}")
-                    log("Monitoring continues after a short retry delay.")
+                    log(f"Monitoring cycle error: {exc}")
+                    log("The monitor will continue with the next cycle.")
 
+                # ----------------------------------------------------
+                # Refresh, also protected from failures.
+                # ----------------------------------------------------
                 elapsed = time.monotonic() - cycle_start
-                wait_time = CHECK_INTERVAL - elapsed
-                if wait_time > 0:
+                wait_time = max(0.0, CHECK_INTERVAL - elapsed)
+                if wait_time:
                     time.sleep(wait_time)
 
                 try:
                     log("Refreshing availability...")
                     if refresh_availability(page):
                         log("Availability refresh completed.")
-                    else:
-                        log(
-                            f"Refresh unsuccessful. Retrying after {REFRESH_RETRY_DELAY:.1f} seconds."
-                        )
-                        time.sleep(REFRESH_RETRY_DELAY)
                 except Exception as exc:
-                    # Even the refresh path has its own safety net.
-                    log(f"Unexpected refresh error: {exc}")
-                    time.sleep(REFRESH_RETRY_DELAY)
+                    log(f"Refresh cycle error: {exc}; continuing.")
 
-        except (KeyboardInterrupt, EOFError):
-            log("Monitor stopped by user. Browser will remain open until this program closes it.")
+        except KeyboardInterrupt:
+            print()
+            print("=" * 64)
+            print("                    MONITOR STOPPED")
+            print("=" * 64)
+            print("Ctrl+C received. Closing the monitor cleanly.")
+            print("The browser will now close.")
+            print("=" * 64)
+
         except Exception as exc:
-            log(f"Unexpected monitor error: {exc}")
-            log("The browser will remain open for inspection.")
-            try:
-                input("Press ENTER to close the browser...")
-            except (EOFError, KeyboardInterrupt):
-                pass
+            # Last-resort protection. Report the error instead of showing
+            # an unexplained traceback, then leave the browser available.
+            log(f"Unexpected top-level error: {exc}")
+            log("Monitor encountered an unexpected problem.")
+
         finally:
-            try:
-                context.close()
-            except Exception:
-                pass
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
