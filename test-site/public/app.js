@@ -47,11 +47,18 @@ async function initReservation() {
   $("#reserveButton").addEventListener('click',async()=>{
     const ids=$$('.booking-block.selected').map(x=>Number(x.dataset.cellId));
     if(!ids.length){$("#message").textContent='Select one or more white cells first.';return;}
-    try{const result=await api('/api/reserve',{method:'POST',body:JSON.stringify({cellIds:ids})});$("#message").textContent=`Reserved cells: ${result.reserved.join(', ')} by ${result.username}.`;await loadGrid();}
+    try{
+      const result=await api('/api/reserve',{method:'POST',body:JSON.stringify({cellIds:ids})});
+      // Reservation is the exception to manual reload: immediately reflect the successful reservation.
+      await loadGrid();
+      $("#message").textContent=`Reserved cells: ${result.reserved.join(', ')} by ${result.username}. The reservation has been recorded in the log.`;
+    }
     catch(e){$("#message").textContent=e.message;}
   });
   await loadGrid();
-  setInterval(async()=>{try{await loadGrid();}catch{}},3000);
+  // Intentionally no automatic polling here. Availability changes are only fetched when
+  // the user presses Reload Availability, except that a successful reservation refreshes
+  // the grid immediately so the reserved cells turn grey.
 }
 async function initAdmin(){
   const user=await guard(); if(!user||user.role!=='admin'){if(user) location.href='/landing.html';return;}
