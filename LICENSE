@@ -1,21 +1,52 @@
-MIT License
+RESERVATION MONITOR – PROPRIETARY LICENSE
 
-Copyright (c) 2026 SRougee
+Copyright (c) 2026 SRougee. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. OWNERSHIP
+The Reservation Monitor software, source code, documentation, configuration,
+and related materials (the "Software") are proprietary and remain the property
+of SRougee.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. NO AUTOMATIC LICENSE
+No license is granted merely because the Software is publicly visible, stored
+on GitHub, downloaded, forked, copied, or otherwise accessible.
 
+You may view the source code for evaluation and review purposes only. You may
+not use, run, copy, modify, adapt, distribute, sublicense, publish, sell,
+rent, lease, host, deploy, or create derivative works from the Software without
+prior written permission from SRougee.
+
+3. COMMERCIAL OR OTHER USE
+Any use beyond personal evaluation requires prior written permission from
+SRougee. Permission may be granted subject to a fee, subscription, royalty,
+commercial agreement, or other terms determined by SRougee.
+
+Commercial use includes, without limitation, using the Software or any modified
+version of it in a business, service, product, website, application, automation,
+internal business process, or for the benefit of a third party.
+
+4. PERMISSION REQUESTS
+To request permission to use the Software, contact the copyright holder through
+the contact details provided in the repository. Permission is valid only when
+confirmed in writing by SRougee.
+
+5. REDISTRIBUTION
+You may not redistribute the Software or substantial portions of its source code
+without prior written permission from SRougee.
+
+6. NO IMPLIED RIGHTS
+Nothing in this license grants rights by implication, estoppel, or otherwise.
+
+7. TERMINATION
+Any permission granted under a separate written agreement may be subject to its
+own terms and may be terminated in accordance with that agreement.
+
+8. DISCLAIMER
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. TO THE MAXIMUM EXTENT
+PERMITTED BY LAW, SRougee SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+9. RESERVATION OF RIGHTS
+All rights not expressly granted in writing are reserved by SRougee.
