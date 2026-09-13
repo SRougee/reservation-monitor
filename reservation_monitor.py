@@ -1,14 +1,7 @@
-"""Sasol Transporters reservation monitor GUI.
-
-Two modes:
-1. Watch Open Slots: checks every 3 minutes and reports available slots only.
-2. Reserve Specific Slot: waits for a chosen date/hour, refreshing until it
-   becomes Available or the user-defined attempt duration expires.
-
-Login and navigation remain manual. Uses only visible website controls.
-"""
+"""Sasol Transporters reservation monitor GUI."""
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from datetime import datetime, timedelta
@@ -19,7 +12,6 @@ from tkinter import messagebox, ttk
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 BASE_URL = "https://www.sasoltransporters.com/sasol2024/"
-URL = BASE_URL
 SLOT_SELECTOR = '.rz-timeslot[title="Available"]'
 ACTION_TIMEOUT = 3_000
 PAGE_LOAD_TIMEOUT = 15_000
@@ -32,45 +24,71 @@ def timestamp() -> str:
 
 
 class SasolMonitor:
+    """Own all Playwright objects from one dedicated thread.
+
+    Tkinter stays on the GUI thread. Commands are queued to this worker, so
+    Playwright is never called concurrently from multiple Python threads.
+    """
+
     def __init__(self, gui):
         self.gui = gui
+        self.commands: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
-        self.thread = None
-        self.browser_thread = None
-        self.context = None
-        self.page = None
-        self.playwright = None
+        self.worker = threading.Thread(target=self._run, daemon=True)
+        self.ready = threading.Event()
         self.closing = False
+        self.worker.start()
 
     def log(self, text):
-        if self.closing:
-            return
-        self.gui.after(0, self.gui.add_log, f"[{timestamp()}] {text}")
+        if not self.closing:
+            self.gui.after(0, self.gui.add_log, f"[{timestamp()}] {text}")
 
-    def open_browser(self):
+    def _run(self):
+        playwright = None
+        context = None
+        page = None
         try:
             self.log("Opening Sasol Transporters...")
-            self.playwright = sync_playwright().start()
-            self.context = self.playwright.chromium.launch_persistent_context(
+            playwright = sync_playwright().start()
+            context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR), headless=False,
                 viewport={"width": 1400, "height": 900})
-            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-            self.page.set_default_timeout(ACTION_TIMEOUT)
-            if self.page.url == "about:blank":
-                self.page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(ACTION_TIMEOUT)
+            if page.url == "about:blank":
+                page.goto(BASE_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            self.ready.set()
             self.log("Browser ready. Log in and navigate to Orders > Unscheduled Orders > Active Slots.")
             self.log("When the Active Slots grid is visible, click Start in the GUI.")
+
+            while not self.closing:
+                try:
+                    command = self.commands.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if command[0] == "watch":
+                    self._watch(page)
+                elif command[0] == "reserve":
+                    self._reserve(page, *command[1:])
+                elif command[0] == "stop":
+                    self.stop_event.set()
         except Exception as exc:
-            if not self.closing:
-                self.log(f"Browser startup error: {exc}")
+            self.log(f"Browser error: {exc}")
+        finally:
+            self.ready.set()
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            try:
+                if playwright:
+                    playwright.stop()
+            except Exception:
+                pass
 
-    def ensure_browser(self):
-        if self.page is None or self.page.is_closed():
-            self.open_browser()
-
-    def visible_available(self):
-        self.ensure_browser()
-        locator = self.page.locator(SLOT_SELECTOR)
+    def _visible_available(self, page):
+        locator = page.locator(SLOT_SELECTOR)
         result = []
         for i in range(locator.count()):
             slot = locator.nth(i)
@@ -81,7 +99,7 @@ class SasolMonitor:
                 pass
         return result
 
-    def describe_slot(self, slot):
+    def _describe_slot(self, slot):
         try:
             hour = (slot.inner_text() or "").strip()
             wrapper = slot.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' rz-timeslots-wrapper ')]").first
@@ -90,15 +108,15 @@ class SasolMonitor:
         except Exception:
             return "unknown slot"
 
-    def slot_signature(self):
-        return self.page.locator(".rz-timeslot").evaluate_all("""
+    def _slot_signature(self, page):
+        return page.locator(".rz-timeslot").evaluate_all("""
             elements => elements.filter(e => { const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none'; })
             .map(e => `${e.title}:${e.className}:${e.textContent.trim()}`).join('|')
         """)
 
-    def refresh(self):
-        before = self.slot_signature()
-        buttons = self.page.locator("button")
+    def _refresh(self, page):
+        before = self._slot_signature(page)
+        buttons = page.locator("button")
         refresh = None
         for i in range(buttons.count()):
             b = buttons.nth(i)
@@ -113,7 +131,7 @@ class SasolMonitor:
         refresh.click(timeout=ACTION_TIMEOUT)
         self.log("Refresh clicked.")
         try:
-            self.page.wait_for_function("""
+            page.wait_for_function("""
                 previous => [...document.querySelectorAll('.rz-timeslot')]
                 .filter(e => { const r=e.getBoundingClientRect(); const s=getComputedStyle(e); return r.width>0 && r.height>0 && s.visibility!=='hidden' && s.display!=='none'; })
                 .map(e => `${e.title}:${e.className}:${e.textContent.trim()}`).join('|') !== previous
@@ -121,8 +139,33 @@ class SasolMonitor:
         except PlaywrightTimeoutError:
             pass
 
-    def reserve_slot(self, target_date, target_hour):
-        slots = self.visible_available()
+    def _wait(self, seconds):
+        return self.stop_event.wait(seconds)
+
+    def _watch(self, page):
+        self.stop_event.clear()
+        self.log("WATCH MODE started — checks every 3 minutes.")
+        while not self.stop_event.is_set() and not self.closing:
+            try:
+                slots = self._visible_available(page)
+                if slots:
+                    self.log(f"OPEN SLOTS FOUND: {len(slots)}")
+                    for slot in slots:
+                        self.log(f"  AVAILABLE: {self._describe_slot(slot)}")
+                else:
+                    self.log("No open slots currently visible.")
+                if self._wait(180):
+                    break
+                self._refresh(page)
+            except Exception as exc:
+                self.log(f"Watch error: {exc}")
+                if self._wait(1):
+                    break
+        self.log("WATCH MODE stopped.")
+        self.gui.after(0, self.gui.set_running, False)
+
+    def _reserve_slot(self, page, target_date, target_hour):
+        slots = self._visible_available(page)
         target = target_date.strftime("%Y-%m-%d")
         for slot in slots:
             try:
@@ -132,8 +175,7 @@ class SasolMonitor:
                 if target in date_text and hour_text == str(target_hour):
                     self.log(f"TARGET OPEN: {date_text} {hour_text}:00")
                     slot.click(timeout=ACTION_TIMEOUT)
-                    self.log("Target slot selected. Pressing Reserve...")
-                    buttons = self.page.locator("button")
+                    buttons = page.locator("button")
                     reserve = None
                     for i in range(buttons.count()):
                         b = buttons.nth(i)
@@ -145,20 +187,20 @@ class SasolMonitor:
                             pass
                     if reserve is None:
                         raise RuntimeError("Visible Reserve button was not found")
+                    self.log("Target slot selected. Pressing Reserve...")
                     reserve.click(timeout=ACTION_TIMEOUT)
                     self.log("Reserve clicked. Checking website response...")
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
-                        dialogs = self.page.locator(".rz-dialog[role='dialog']")
+                        dialogs = page.locator(".rz-dialog[role='dialog']")
                         for i in range(dialogs.count()):
                             d = dialogs.nth(i)
                             try:
                                 if d.is_visible():
                                     text = (d.inner_text() or "").strip()
                                     self.log(f"Website response: {text}")
-                                    if any(x in text.casefold() for x in ("no longer available", "error", "failed", "not available")):
-                                        return False
-                                    return True
+                                    bad = ("no longer available", "error", "failed", "not available")
+                                    return not any(x in text.casefold() for x in bad)
                             except Exception:
                                 pass
                         time.sleep(0.05)
@@ -168,93 +210,62 @@ class SasolMonitor:
                 self.log(f"Target check error: {exc}")
         return False
 
-    def watch_worker(self):
-        self.log("WATCH MODE started — checks every 3 minutes.")
-        while not self.stop_event.is_set():
-            try:
-                slots = self.visible_available()
-                if slots:
-                    self.log(f"OPEN SLOTS FOUND: {len(slots)}")
-                    for slot in slots:
-                        self.log(f"  AVAILABLE: {self.describe_slot(slot)}")
-                else:
-                    self.log("No open slots currently visible.")
-                if self.stop_event.wait(180): break
-                self.refresh()
-            except Exception as exc:
-                self.log(f"Watch error: {exc}")
-                if self.stop_event.wait(1): break
-        self.log("WATCH MODE stopped.")
-
-    def reserve_worker(self, target_date, target_hour, duration_minutes):
+    def _reserve(self, page, target_date, target_hour, duration_minutes):
+        self.stop_event.clear()
         self.log(f"RESERVATION MODE started for {target_date:%Y-%m-%d} cell/hour {target_hour}.")
         deadline = datetime.now() + timedelta(minutes=duration_minutes)
-        while not self.stop_event.is_set() and datetime.now() <= deadline:
+        while not self.stop_event.is_set() and not self.closing and datetime.now() <= deadline:
             try:
-                if self.reserve_slot(target_date, target_hour):
+                if self._reserve_slot(page, target_date, target_hour):
                     self.log("RESERVATION COMPLETED. Program stopped.")
+                    self.gui.after(0, self.gui.set_running, False)
                     return
                 remaining = max(0, int((deadline - datetime.now()).total_seconds()))
+                if remaining <= 0:
+                    break
                 self.log(f"Target not available. Refreshing. Time remaining: {remaining}s")
-                self.refresh()
+                self._refresh(page)
             except Exception as exc:
                 self.log(f"Reservation check error: {exc}")
-                if self.stop_event.wait(1): return
-        self.log("RESERVATION TIME LIMIT REACHED — no reservation made.")
+                if self._wait(1):
+                    break
+        if not self.stop_event.is_set():
+            self.log("RESERVATION TIME LIMIT REACHED — no reservation made.")
+        else:
+            self.log("RESERVATION MODE stopped.")
+        self.gui.after(0, self.gui.set_running, False)
 
     def start_watch(self):
-        self.start(self.watch_worker)
+        if not self.ready.is_set() or self.closing:
+            self.log("Browser is not ready yet. Please wait a moment and try again.")
+            return
+        self.commands.put(("watch",))
+        self.gui.set_running(True)
 
     def start_reservation(self, target_date, target_hour, duration):
-        self.start(lambda: self.reserve_worker(target_date, target_hour, duration))
-
-    def start(self, worker):
-        if self.thread and self.thread.is_alive():
-            self.log("A monitor is already running.")
+        if not self.ready.is_set() or self.closing:
+            self.log("Browser is not ready yet. Please wait a moment and try again.")
             return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=worker, daemon=True)
-        self.thread.start()
+        self.commands.put(("reserve", target_date, target_hour, duration))
         self.gui.set_running(True)
 
     def stop(self):
         self.stop_event.set()
+        self.commands.put(("stop",))
         self.gui.set_running(False)
-        self.log("Stop requested.")
+        self.log("Stop requested. Browser will remain open.")
 
     def close(self):
-        """Stop all workers first, then close Playwright cleanly.
-
-        This prevents the Playwright Node driver from trying to write to a
-        closed pipe, which can produce an EPIPE traceback in the console.
-        """
         self.closing = True
         self.stop_event.set()
-
-        # Give the active monitor thread time to leave any Playwright call.
-        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
-            self.thread.join(timeout=4)
-
-        # The browser-opening thread may still be starting Playwright.
-        if self.browser_thread and self.browser_thread.is_alive() and self.browser_thread is not threading.current_thread():
-            self.browser_thread.join(timeout=4)
-
         try:
-            if self.context:
-                self.context.close()
+            self.commands.put(("stop",))
         except Exception:
             pass
-        finally:
-            self.context = None
-            self.page = None
-
-        try:
-            if self.playwright:
-                self.playwright.stop()
-        except Exception:
-            pass
-        finally:
-            self.playwright = None
+        if self.worker.is_alive() and self.worker is not threading.current_thread():
+            self.worker.join(timeout=6)
+        if self.worker.is_alive():
+            self.log("Playwright worker did not stop within the normal timeout.")
 
 
 class App(tk.Tk):
@@ -266,8 +277,6 @@ class App(tk.Tk):
         self.monitor = SasolMonitor(self)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build_ui()
-        self.monitor.browser_thread = threading.Thread(target=self.monitor.open_browser, daemon=True)
-        self.monitor.browser_thread.start()
 
     def build_ui(self):
         outer = ttk.Frame(self, padding=18)
@@ -333,8 +342,10 @@ class App(tk.Tk):
             target_date = datetime.strptime(self.date_var.get().strip(), "%Y-%m-%d").date()
             hour = int(self.hour_var.get().strip())
             duration = float(self.duration_var.get().strip())
-            if not 0 <= hour <= 23: raise ValueError("Cell/hour must be between 0 and 23.")
-            if duration <= 0: raise ValueError("Duration must be greater than 0 minutes.")
+            if not 0 <= hour <= 23:
+                raise ValueError("Cell/hour must be between 0 and 23.")
+            if duration <= 0:
+                raise ValueError("Duration must be greater than 0 minutes.")
         except ValueError as exc:
             messagebox.showerror("Invalid settings", str(exc))
             return
