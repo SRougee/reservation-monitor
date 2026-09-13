@@ -31,7 +31,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 # SETTINGS
 # ============================================================
 
-BASE_URL = "https://www.sasoltransporters.com"
+BASE_URL = "https://www.sasoltransporters.com/sasol2024/"
 # Deliberately open the website root. Login and navigation are manual.
 URL = BASE_URL
 
