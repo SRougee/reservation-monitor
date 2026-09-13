@@ -5,9 +5,10 @@ Sasol Transporters reservation monitor
 Browser-realistic Playwright monitor for the authenticated Sasol Transporters
 Unscheduled Orders / Active Slots page.
 
-The monitor uses only the normal visible website controls. Login is performed
-manually in the visible browser. It does not access private APIs, databases,
-Cloudflare, or server-side interfaces.
+The monitor opens the Sasol Transporters website only. The user logs in
+manually and navigates to the correct reservation page before monitoring starts.
+It uses only the normal visible website controls. It does not access private
+APIs, databases, Cloudflare, or server-side interfaces.
 
 Selection rule for this real-world adapter:
     Select ALL currently visible slots marked Available, then press Reserve.
@@ -31,7 +32,8 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 # ============================================================
 
 BASE_URL = "https://www.sasoltransporters.com"
-URL = f"{BASE_URL}/sasol2024/unscheduled-orders"
+# Deliberately open the website root. Login and navigation are manual.
+URL = BASE_URL
 
 # Actual Sasol Transporters slot markup from the supplied authenticated HTML.
 SLOT_SELECTOR = '.rz-timeslot[title="Available"]'
@@ -181,12 +183,7 @@ def describe_slot(slot) -> str:
 
 
 def select_all_available(page) -> list[str]:
-    """Click every visible Available slot in one browser-side operation.
-
-    The supplied real page uses title="Available" rather than the simulator's
-    .booking-block.available markup. We deliberately filter to the visible
-    copy because the Blazor page contains both desktop and mobile renderings.
-    """
+    """Click every visible Available slot in one browser-side operation."""
     try:
         selected = page.locator(SLOT_SELECTOR).evaluate_all(
             """
@@ -349,11 +346,11 @@ def main() -> None:
     print("=" * 72)
     print("              SASOL TRANSPORTERS RESERVATION MONITOR")
     print("=" * 72)
-    print(f"URL:                 {URL}")
-    print(f"Available selector:  {SLOT_SELECTOR}")
+    print(f"Opening website:     {URL}")
     print("Selection:           ALL currently visible Available slots")
     print("Refresh:             Normal visible refresh button")
     print("Login:               Manual in visible browser")
+    print("Navigation:          Manual — you choose the correct reservation page")
     print("Privileged APIs:     DISABLED")
     print("Full page reloads:   DISABLED")
     print("Runtime:             Continuous until Ctrl+C")
@@ -395,10 +392,14 @@ def main() -> None:
                     print("=" * 72)
                     print("                         LOGIN / READY")
                     print("=" * 72)
-                    print("Log in manually if required and open Unscheduled Orders > Active Slots.")
+                    print("The Sasol Transporters website is open.")
+                    print("Log in manually if required.")
+                    print("Navigate manually to the correct reservation page:")
+                    print("    Orders > Unscheduled Orders > Active Slots")
                     print("Make sure the Active Slots grid is visible.")
+                    print("Nothing will be clicked until you confirm you are ready.")
                     print("Type Y or YES when ready to start monitoring.")
-                    print("The monitor will select ALL visible Available slots and press Reserve.")
+                    print("The monitor will then select ALL visible Available slots and press Reserve.")
                     print("=" * 72)
                     print()
 
