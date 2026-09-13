@@ -166,7 +166,9 @@ def describe_slot(slot) -> str:
     """Return date/hour information from the slot's date wrapper."""
     try:
         hour = (slot.inner_text() or "").strip()
-        wrapper = slot.locator(f"xpath=ancestor::{TIMESLOT_WRAPPER_SELECTOR.lstrip('.')}").first
+        wrapper = slot.locator(
+            "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' rz-timeslots-wrapper ')]"
+        ).first
         date_text = (wrapper.locator(".rz-timeslots-date").inner_text() or "").strip()
         if date_text:
             return f"{date_text} {hour}:00"
@@ -235,14 +237,12 @@ def dismiss_visible_dialog(page) -> None:
             if not dialog.is_visible():
                 continue
 
-            # Prefer an OK/Close button inside the dialog.
             for label in ("OK", "Close"):
                 buttons = dialog.get_by_role("button", name=label, exact=True)
                 if buttons.count():
                     buttons.first.click(timeout=1_000)
                     return
 
-            # Fall back to the visible Radzen dialog close button.
             close = dialog.locator(".rz-dialog-titlebar-close")
             if close.count() and close.first.is_visible():
                 close.first.click(timeout=1_000)
@@ -267,14 +267,15 @@ def reserve_selected(page, expected_count: int) -> bool:
         log(f"ERROR clicking Reserve: {exc}")
         return False
 
-    # The real site can display a Radzen error dialog such as
-    # "unfortunately the slot is no longer available". Check for that first.
     deadline = time.monotonic() + RESERVATION_RESULT_TIMEOUT / 1000
     while time.monotonic() < deadline:
         dialog_text = visible_dialog_text(page)
         if dialog_text:
             lowered = dialog_text.casefold()
-            if "no longer available" in lowered or "error" in lowered:
+            if any(
+                phrase in lowered
+                for phrase in ("no longer available", "error", "failed", "not available")
+            ):
                 log(f"Website reservation response: {dialog_text}")
                 dismiss_visible_dialog(page)
                 return False
@@ -414,15 +415,12 @@ def main() -> None:
                     log("Monitoring started. Press Ctrl+C to stop.")
 
                 try:
-                    # First inspect anything already visible.
                     if process_available(page):
                         log("Reservation cycle completed.")
                         continue
 
-                    # No availability: use the website's normal refresh action.
                     reload_availability(page)
 
-                    # React immediately to the refreshed browser-visible grid.
                     if process_available(page):
                         log("Reservation cycle completed.")
 
