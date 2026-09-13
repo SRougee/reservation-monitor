@@ -36,25 +36,33 @@ class SasolMonitor:
         self.gui = gui
         self.stop_event = threading.Event()
         self.thread = None
+        self.browser_thread = None
         self.context = None
         self.page = None
         self.playwright = None
+        self.close_requested = False
 
     def log(self, text):
-        self.gui.after(0, self.gui.add_log, f"[{timestamp()}] {text}")
+        try:
+            self.gui.after(0, self.gui.add_log, f"[{timestamp()}] {text}")
+        except Exception:
+            pass
 
     def open_browser(self):
-        self.log("Opening Sasol Transporters...")
-        self.playwright = sync_playwright().start()
-        self.context = self.playwright.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR), headless=False,
-            viewport={"width": 1400, "height": 900})
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-        self.page.set_default_timeout(ACTION_TIMEOUT)
-        if self.page.url == "about:blank":
-            self.page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-        self.log("Browser ready. Log in and navigate to Orders > Unscheduled Orders > Active Slots.")
-        self.log("When the Active Slots grid is visible, click Start in the GUI.")
+        try:
+            self.log("Opening Sasol Transporters...")
+            self.playwright = sync_playwright().start()
+            self.context = self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR), headless=False,
+                viewport={"width": 1400, "height": 900})
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            self.page.set_default_timeout(ACTION_TIMEOUT)
+            if self.page.url == "about:blank":
+                self.page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            self.log("Browser ready. Log in and navigate to Orders > Unscheduled Orders > Active Slots.")
+            self.log("When the Active Slots grid is visible, click Start in the GUI.")
+        except Exception as exc:
+            self.log(f"Browser error: {exc}")
 
     def ensure_browser(self):
         if self.page is None or self.page.is_closed():
@@ -212,16 +220,33 @@ class SasolMonitor:
     def stop(self):
         self.stop_event.set()
         self.gui.set_running(False)
-        self.log("Stop requested.")
+        self.log("Stop requested. Browser will remain open.")
 
     def close(self):
+        """Gracefully stop monitoring and close the browser session."""
+        self.close_requested = True
         self.stop_event.set()
+
+        # Give an active monitor worker a moment to finish its current operation.
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5)
+
         try:
-            if self.context: self.context.close()
-        except Exception: pass
+            if self.context:
+                self.context.close()
+        except Exception as exc:
+            self.log(f"Browser close warning: {exc}")
+        finally:
+            self.context = None
+            self.page = None
+
         try:
-            if self.playwright: self.playwright.stop()
-        except Exception: pass
+            if self.playwright:
+                self.playwright.stop()
+        except Exception as exc:
+            self.log(f"Playwright close warning: {exc}")
+        finally:
+            self.playwright = None
 
 
 class App(tk.Tk):
@@ -233,7 +258,8 @@ class App(tk.Tk):
         self.monitor = SasolMonitor(self)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build_ui()
-        threading.Thread(target=self.monitor.open_browser, daemon=True).start()
+        self.monitor.browser_thread = threading.Thread(target=self.monitor.open_browser, daemon=True)
+        self.monitor.browser_thread.start()
 
     def build_ui(self):
         outer = ttk.Frame(self, padding=18)
@@ -267,6 +293,8 @@ class App(tk.Tk):
         control = ttk.Frame(outer); control.pack(fill="x", pady=(0, 10))
         self.stop_btn = ttk.Button(control, text="STOP", command=self.monitor.stop)
         self.stop_btn.pack(side="left")
+        self.exit_btn = ttk.Button(control, text="EXIT", command=self.on_close)
+        self.exit_btn.pack(side="left", padx=(8, 0))
         self.status_var = tk.StringVar(value="Opening browser...")
         ttk.Label(control, textvariable=self.status_var).pack(side="left", padx=15)
 
@@ -303,6 +331,23 @@ class App(tk.Tk):
         self.monitor.start_reservation(target_date, hour, duration)
 
     def on_close(self):
+        if not messagebox.askyesno(
+            "Exit Sasol Slot Monitor",
+            "Are you sure you want to exit?\n\n"
+            "Any active monitoring will be stopped and the browser session will be closed."
+        ):
+            return
+
+        self.status_var.set("Closing safely...")
+        self.watch_btn.configure(state="disabled")
+        self.reserve_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
+        self.exit_btn.configure(state="disabled")
+        self.add_log(f"[{timestamp()}] Closing program safely...")
+
+        # Close on the Tkinter thread only after the worker has been asked to stop.
+        # The monitor's stop Event is interruptible, so the normal 3-minute wait
+        # does not delay the exit.
         self.monitor.close()
         self.destroy()
 
