@@ -1,17 +1,19 @@
 """
-DOM Reservation Monitor
-=======================
+Sasol Transporters reservation monitor
+======================================
 
-Fast, browser-realistic Playwright monitor.
+Browser-realistic Playwright monitor for the authenticated Sasol Transporters
+Unscheduled Orders / Active Slots page.
 
-The monitor assumes availability is NOT pushed automatically by the website.
-It uses the normal visible "Reload Availability" control, waits for the
-browser-visible grid update, then immediately checks for all available cells.
+The monitor uses only the normal visible website controls. Login is performed
+manually in the visible browser. It does not access private APIs, databases,
+Cloudflare, or server-side interfaces.
 
-It does not access Cloudflare, D1, Worker code, Admin Log, or private server
-interfaces. It only interacts with the logged-in reservation page.
+Selection rule for this real-world adapter:
+    Select ALL currently visible slots marked Available, then press Reserve.
 
-The monitor runs continuously until Ctrl+C.
+The browser profile is persistent so an existing authenticated session can be
+reused between runs.
 """
 
 from __future__ import annotations
@@ -28,15 +30,22 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 # SETTINGS
 # ============================================================
 
-URL = "https://reservation-monitor-test.ronaldjennings84.workers.dev/"
-BLOCK_SELECTOR = ".booking-block"
-TARGET_TEXT = ""
-AVAILABLE_CLASS = "available"
-RESERVE_BUTTON_SELECTOR = "#reserveButton"
-REFRESH_BUTTON_SELECTOR = "#reloadGrid"
-RESERVATION_MESSAGE_SELECTOR = "#message"
-RESERVATION_SUCCESS_TEXT = "Reserved cells:"
-PAGE_LOAD_TIMEOUT = 10_000
+BASE_URL = "https://www.sasoltransporters.com"
+URL = f"{BASE_URL}/sasol2024/unscheduled-orders"
+
+# Actual Sasol Transporters slot markup from the supplied authenticated HTML.
+SLOT_SELECTOR = '.rz-timeslot[title="Available"]'
+TIMESLOT_WRAPPER_SELECTOR = ".rz-timeslots-wrapper"
+
+# The page has separate desktop/mobile copies of some controls. We always use
+# the visible one instead of relying on generated Blazor/Radzen element IDs.
+RESERVE_BUTTON_TEXT = "Reserve"
+REFRESH_ICON_TEXT = "refresh"
+
+PAGE_LOAD_TIMEOUT = 15_000
+DOM_UPDATE_TIMEOUT = 3_000
+ACTION_TIMEOUT = 3_000
+RESERVATION_RESULT_TIMEOUT = 5_000
 DEBUG = True
 PROFILE_DIR = Path(".browser-profile")
 
@@ -66,162 +75,267 @@ def page_is_alive(page) -> bool:
         return False
 
 
-def grid_signature(page) -> str:
-    """Return a compact browser-side signature of cell state."""
-    return page.locator(BLOCK_SELECTOR).evaluate_all(
-        "elements => elements.map(e => `${e.dataset.cellId}:${e.className}`).join('|')"
+def visible_slots(page):
+    """Return visible Available slots only.
+
+    The real page renders desktop and mobile markup. Filtering by visibility
+    prevents us from clicking both copies of the same slot.
+    """
+    locator = page.locator(SLOT_SELECTOR)
+    result = []
+    for index in range(locator.count()):
+        slot = locator.nth(index)
+        try:
+            if slot.is_visible():
+                result.append(slot)
+        except Exception:
+            continue
+    return result
+
+
+def slot_signature(page) -> str:
+    """Return a browser-visible signature of all visible slot states."""
+    return page.locator(".rz-timeslot").evaluate_all(
+        """
+        elements => elements
+            .filter(e => {
+                const r = e.getBoundingClientRect();
+                const s = getComputedStyle(e);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+            })
+            .map(e => `${e.title}:${e.className}:${e.textContent.trim()}`)
+            .join('|')
+        """
     )
 
 
 def wait_for_grid_update(page, previous_signature: str) -> bool:
-    """Wait for the normal Reload button's DOM update; no fixed sleep."""
+    """Wait for the normal refresh action to visibly change the slot grid."""
     try:
         page.wait_for_function(
             """
             previous => {
-                const elements = [...document.querySelectorAll('.booking-block')];
-                const current = elements.map(e => `${e.dataset.cellId}:${e.className}`).join('|');
+                const current = [...document.querySelectorAll('.rz-timeslot')]
+                    .filter(e => {
+                        const r = e.getBoundingClientRect();
+                        const s = getComputedStyle(e);
+                        return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+                    })
+                    .map(e => `${e.title}:${e.className}:${e.textContent.trim()}`)
+                    .join('|');
                 return current !== previous;
             }
             """,
             previous_signature,
-            timeout=3_000,
+            timeout=DOM_UPDATE_TIMEOUT,
         )
         return True
     except PlaywrightTimeoutError:
         return False
 
 
-def find_available_blocks(page):
-    """Find all currently available matching blocks with one browser query."""
-    locator = page.locator(f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}")
-    count = locator.count()
-    result = []
-
-    if TARGET_TEXT:
-        target = TARGET_TEXT.casefold()
-        for index in range(count):
-            block = locator.nth(index)
-            if target in (block.inner_text() or "").casefold():
-                result.append(block)
-    else:
-        for index in range(count):
-            result.append(locator.nth(index))
-
-    return result
+def visible_button_with_text(page, text: str):
+    """Find the first visible button containing the requested text."""
+    buttons = page.locator("button")
+    for index in range(buttons.count()):
+        button = buttons.nth(index)
+        try:
+            if button.is_visible() and text.casefold() in button.inner_text().casefold():
+                return button
+        except Exception:
+            continue
+    return None
 
 
-def select_all_available(page) -> list[int]:
-    """Select all available matching cells in one browser-side operation."""
-    selector = f"{BLOCK_SELECTOR}.{AVAILABLE_CLASS}"
+def visible_refresh_button(page):
+    """Find the visible Radzen refresh button by its stable icon text."""
+    buttons = page.locator("button")
+    for index in range(buttons.count()):
+        button = buttons.nth(index)
+        try:
+            if not button.is_visible():
+                continue
+            if REFRESH_ICON_TEXT.casefold() in button.inner_text().casefold():
+                return button
+        except Exception:
+            continue
+    return None
+
+
+def describe_slot(slot) -> str:
+    """Return date/hour information from the slot's date wrapper."""
     try:
-        ids = page.locator(selector).evaluate_all(
-            """
-            (elements, targetText) => {
-                const target = String(targetText || '').toLowerCase();
-                const selected = [];
+        hour = (slot.inner_text() or "").strip()
+        wrapper = slot.locator(f"xpath=ancestor::{TIMESLOT_WRAPPER_SELECTOR.lstrip('.')}").first
+        date_text = (wrapper.locator(".rz-timeslots-date").inner_text() or "").strip()
+        if date_text:
+            return f"{date_text} {hour}:00"
+        return hour
+    except Exception:
+        try:
+            return (slot.inner_text() or "").strip()
+        except Exception:
+            return "unknown slot"
 
+
+def select_all_available(page) -> list[str]:
+    """Click every visible Available slot in one browser-side operation.
+
+    The supplied real page uses title="Available" rather than the simulator's
+    .booking-block.available markup. We deliberately filter to the visible
+    copy because the Blazor page contains both desktop and mobile renderings.
+    """
+    try:
+        selected = page.locator(SLOT_SELECTOR).evaluate_all(
+            """
+            elements => {
+                const selected = [];
                 for (const element of elements) {
-                    if (target && !element.innerText.toLowerCase().includes(target)) continue;
-                    if (!element.classList.contains('available')) continue;
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    const visible = rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                    if (!visible || element.title !== 'Available') continue;
+
+                    const wrapper = element.closest('.rz-timeslots-wrapper');
+                    const date = wrapper?.querySelector('.rz-timeslots-date')?.textContent?.trim() || '';
+                    const hour = element.textContent?.trim() || '';
                     element.click();
-                    selected.push(Number(element.dataset.cellId));
+                    selected.push(`${date} ${hour}:00`.trim());
                 }
                 return selected;
             }
-            """,
-            TARGET_TEXT,
+            """
         )
-        return [int(value) for value in ids]
+        return [str(value) for value in selected]
     except Exception as exc:
-        log(f"Could not select all available cells in one operation: {exc}")
+        log(f"Could not select available slots: {exc}")
         return []
 
 
-def clear_reservation_message(page) -> None:
+def visible_dialog_text(page) -> str:
+    """Read the text of the visible Radzen dialog, if one exists."""
+    dialogs = page.locator(".rz-dialog[role='dialog']")
+    for index in range(dialogs.count()):
+        dialog = dialogs.nth(index)
+        try:
+            if dialog.is_visible():
+                return (dialog.inner_text() or "").strip()
+        except Exception:
+            continue
+    return ""
+
+
+def dismiss_visible_dialog(page) -> None:
+    """Close a visible Radzen dialog using its normal close/OK control."""
     try:
-        page.locator(RESERVATION_MESSAGE_SELECTOR).evaluate(
-            "element => { element.textContent = ''; }"
-        )
+        dialogs = page.locator(".rz-dialog[role='dialog']")
+        for index in range(dialogs.count()):
+            dialog = dialogs.nth(index)
+            if not dialog.is_visible():
+                continue
+
+            # Prefer an OK/Close button inside the dialog.
+            for label in ("OK", "Close"):
+                buttons = dialog.get_by_role("button", name=label, exact=True)
+                if buttons.count():
+                    buttons.first.click(timeout=1_000)
+                    return
+
+            # Fall back to the visible Radzen dialog close button.
+            close = dialog.locator(".rz-dialog-titlebar-close")
+            if close.count() and close.first.is_visible():
+                close.first.click(timeout=1_000)
+                return
     except Exception:
         pass
 
 
-def reserve_selected(page) -> bool:
-    """Submit all selected cells and wait for the new browser-visible result."""
+def reserve_selected(page, expected_count: int) -> bool:
+    """Press the real Reserve button and report the browser-visible outcome."""
+    button = visible_button_with_text(page, RESERVE_BUTTON_TEXT)
+    if button is None:
+        log("ERROR: Visible Reserve button was not found.")
+        return False
+
+    before_signature = slot_signature(page)
+
     try:
-        button = page.locator(RESERVE_BUTTON_SELECTOR).first
-        button.wait_for(state="visible", timeout=2_000)
-        clear_reservation_message(page)
+        log(f"Submitting {expected_count} selected slot(s)...")
+        button.click(timeout=ACTION_TIMEOUT)
+    except Exception as exc:
+        log(f"ERROR clicking Reserve: {exc}")
+        return False
 
-        log("Submitting all selected cells...")
-        button.click()
+    # The real site can display a Radzen error dialog such as
+    # "unfortunately the slot is no longer available". Check for that first.
+    deadline = time.monotonic() + RESERVATION_RESULT_TIMEOUT / 1000
+    while time.monotonic() < deadline:
+        dialog_text = visible_dialog_text(page)
+        if dialog_text:
+            lowered = dialog_text.casefold()
+            if "no longer available" in lowered or "error" in lowered:
+                log(f"Website reservation response: {dialog_text}")
+                dismiss_visible_dialog(page)
+                return False
 
-        page.wait_for_function(
-            "() => Boolean(document.querySelector('#message')?.textContent?.trim())",
-            timeout=3_000,
-        )
-
-        text = page.locator(RESERVATION_MESSAGE_SELECTOR).inner_text(timeout=500).strip()
-        if text.startswith(RESERVATION_SUCCESS_TEXT):
-            log(f"Website confirmed reservation: {text}")
+            log(f"Website dialog response: {dialog_text}")
+            dismiss_visible_dialog(page)
             return True
 
-        log(f"Website reservation response: {text or 'no readable response'}")
-        return False
+        try:
+            after_signature = slot_signature(page)
+            if after_signature != before_signature:
+                log("Reservation action changed the visible slot grid.")
+                return True
+        except Exception:
+            pass
 
-    except PlaywrightTimeoutError:
-        log("ERROR: No reservation response received within 3 seconds.")
-        return False
-    except Exception as exc:
-        log(f"ERROR submitting reservation: {exc}")
-        return False
+        time.sleep(0.05)
+
+    log("No explicit reservation confirmation was visible after Reserve.")
+    return False
 
 
-def reload_and_process(page) -> None:
-    """Press the site's normal refresh control and react immediately to its DOM result."""
-    previous_signature = grid_signature(page)
-
-    refresh = page.locator(REFRESH_BUTTON_SELECTOR).first
-    refresh.wait_for(state="visible", timeout=2_000)
+def reload_availability(page) -> None:
+    """Press the site's normal visible refresh control."""
+    previous_signature = slot_signature(page)
+    refresh = visible_refresh_button(page)
+    if refresh is None:
+        raise RuntimeError("Visible refresh button was not found")
 
     start = time.perf_counter()
-    refresh.click()
+    refresh.click(timeout=ACTION_TIMEOUT)
     log("Reload Availability clicked.")
 
-    # The browser itself updates the grid. We wait for that visible change,
-    # rather than sleeping for an arbitrary amount of time.
     changed = wait_for_grid_update(page, previous_signature)
     elapsed_ms = (time.perf_counter() - start) * 1000
 
     if changed:
-        log(f"Grid changed after reload ({elapsed_ms:.1f} ms). Checking immediately.")
+        log(f"Visible slot grid changed after reload ({elapsed_ms:.1f} ms).")
     else:
-        log(f"No visible grid change after reload within 3 seconds ({elapsed_ms:.1f} ms).")
+        log(f"No visible slot-grid change within {DOM_UPDATE_TIMEOUT} ms ({elapsed_ms:.1f} ms).")
 
 
 def process_available(page) -> bool:
-    """Find and reserve every currently available matching cell."""
-    blocks = find_available_blocks(page)
-    if not blocks:
+    """Select ALL visible Available slots and submit them together."""
+    slots = visible_slots(page)
+    if not slots:
         return False
 
-    ids_preview = []
-    for block in blocks:
-        try:
-            ids_preview.append(int(block.get_attribute("data-cell-id")))
-        except Exception:
-            pass
+    descriptions = []
+    for slot in slots:
+        descriptions.append(describe_slot(slot))
 
-    log(f"Found {len(blocks)} available matching cell(s): {ids_preview}")
-    selected_ids = select_all_available(page)
+    log(f"Found {len(slots)} available slot(s): {descriptions}")
 
-    if not selected_ids:
-        log("Available cells were found but none could be selected.")
+    selected = select_all_available(page)
+    if not selected:
+        log("Available slots were found but none could be selected.")
         return False
 
-    log(f"Selected ALL {len(selected_ids)} matching cell(s): {selected_ids}")
-    return reserve_selected(page)
+    log(f"Selected ALL {len(selected)} available slot(s): {selected}")
+    return reserve_selected(page, len(selected))
 
 
 # ============================================================
@@ -229,38 +343,26 @@ def process_available(page) -> bool:
 # ============================================================
 
 
-def validate_settings() -> None:
-    if "YOUR-WEBSITE-HERE" in URL:
-        print("ERROR: Change URL in the SETTINGS section.")
-        sys.exit(1)
-
-
 def main() -> None:
-    validate_settings()
-
     print()
-    print("=" * 70)
-    print("                 DOM RESERVATION MONITOR")
-    print("=" * 70)
+    print("=" * 72)
+    print("              SASOL TRANSPORTERS RESERVATION MONITOR")
+    print("=" * 72)
     print(f"URL:                 {URL}")
-    print(f"Block selector:      {BLOCK_SELECTOR}")
-    print(f"Available class:     {AVAILABLE_CLASS}")
-    print(f"Refresh selector:    {REFRESH_BUTTON_SELECTOR}")
-    print(f"Reserve selector:    {RESERVE_BUTTON_SELECTOR}")
-    print("Detection:           Browser-visible DOM change")
+    print(f"Available selector:  {SLOT_SELECTOR}")
+    print("Selection:           ALL currently visible Available slots")
+    print("Refresh:             Normal visible refresh button")
+    print("Login:               Manual in visible browser")
+    print("Privileged APIs:     DISABLED")
     print("Full page reloads:   DISABLED")
-    print("Admin/log access:    DISABLED")
-    print("Selection:           ALL matching cells in one browser operation")
-    print("Refresh method:      Normal Reload Availability button")
     print("Runtime:             Continuous until Ctrl+C")
-    print("=" * 70)
+    print("=" * 72)
     print()
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as playwright:
         context = None
-
         try:
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir=str(PROFILE_DIR),
@@ -268,19 +370,19 @@ def main() -> None:
                 viewport={"width": 1400, "height": 900},
             )
             page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(2_000)
+            page.set_default_timeout(ACTION_TIMEOUT)
             ready = False
 
             while True:
                 if not page_is_alive(page):
-                    log("Browser page is unavailable. Attempting recovery...")
+                    log("Browser page is unavailable. Opening a replacement page...")
                     page = context.new_page()
-                    page.set_default_timeout(2_000)
+                    page.set_default_timeout(ACTION_TIMEOUT)
                     ready = False
 
                 try:
                     if page.url == "about:blank":
-                        log("Opening website...")
+                        log("Opening Sasol Transporters...")
                         page.goto(URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
                 except Exception as exc:
                     log(f"Could not open/navigate page: {exc}")
@@ -289,14 +391,14 @@ def main() -> None:
 
                 if not ready:
                     print()
-                    print("=" * 70)
+                    print("=" * 72)
                     print("                         LOGIN / READY")
-                    print("=" * 70)
-                    print("Log in manually if needed and navigate to the Reservations page.")
+                    print("=" * 72)
+                    print("Log in manually if required and open Unscheduled Orders > Active Slots.")
+                    print("Make sure the Active Slots grid is visible.")
                     print("Type Y or YES when ready to start monitoring.")
-                    print("The monitor will press the normal Reload Availability button.")
-                    print("It will not reload the whole page.")
-                    print("=" * 70)
+                    print("The monitor will select ALL visible Available slots and press Reserve.")
+                    print("=" * 72)
                     print()
 
                     while True:
@@ -312,16 +414,15 @@ def main() -> None:
                     log("Monitoring started. Press Ctrl+C to stop.")
 
                 try:
-                    # Check anything already visible before the first reload.
+                    # First inspect anything already visible.
                     if process_available(page):
                         log("Reservation cycle completed.")
                         continue
 
-                    # No availability: use the site's normal refresh control.
-                    # There is no artificial polling sleep between refreshes.
-                    reload_and_process(page)
+                    # No availability: use the website's normal refresh action.
+                    reload_availability(page)
 
-                    # React immediately to the refreshed DOM.
+                    # React immediately to the refreshed browser-visible grid.
                     if process_available(page):
                         log("Reservation cycle completed.")
 
@@ -332,11 +433,11 @@ def main() -> None:
 
         except KeyboardInterrupt:
             print()
-            print("=" * 70)
+            print("=" * 72)
             print("                    MONITOR STOPPED")
-            print("=" * 70)
+            print("=" * 72)
             print("Ctrl+C received. Closing the monitor cleanly.")
-            print("=" * 70)
+            print("=" * 72)
 
         except Exception as exc:
             log(f"Unexpected top-level error: {exc}")
