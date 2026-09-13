@@ -40,13 +40,12 @@ class SasolMonitor:
         self.context = None
         self.page = None
         self.playwright = None
-        self.close_requested = False
+        self.closing = False
 
     def log(self, text):
-        try:
-            self.gui.after(0, self.gui.add_log, f"[{timestamp()}] {text}")
-        except Exception:
-            pass
+        if self.closing:
+            return
+        self.gui.after(0, self.gui.add_log, f"[{timestamp()}] {text}")
 
     def open_browser(self):
         try:
@@ -62,7 +61,8 @@ class SasolMonitor:
             self.log("Browser ready. Log in and navigate to Orders > Unscheduled Orders > Active Slots.")
             self.log("When the Active Slots grid is visible, click Start in the GUI.")
         except Exception as exc:
-            self.log(f"Browser error: {exc}")
+            if not self.closing:
+                self.log(f"Browser startup error: {exc}")
 
     def ensure_browser(self):
         if self.page is None or self.page.is_closed():
@@ -220,22 +220,30 @@ class SasolMonitor:
     def stop(self):
         self.stop_event.set()
         self.gui.set_running(False)
-        self.log("Stop requested. Browser will remain open.")
+        self.log("Stop requested.")
 
     def close(self):
-        """Gracefully stop monitoring and close the browser session."""
-        self.close_requested = True
+        """Stop all workers first, then close Playwright cleanly.
+
+        This prevents the Playwright Node driver from trying to write to a
+        closed pipe, which can produce an EPIPE traceback in the console.
+        """
+        self.closing = True
         self.stop_event.set()
 
-        # Give an active monitor worker a moment to finish its current operation.
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=5)
+        # Give the active monitor thread time to leave any Playwright call.
+        if self.thread and self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=4)
+
+        # The browser-opening thread may still be starting Playwright.
+        if self.browser_thread and self.browser_thread.is_alive() and self.browser_thread is not threading.current_thread():
+            self.browser_thread.join(timeout=4)
 
         try:
             if self.context:
                 self.context.close()
-        except Exception as exc:
-            self.log(f"Browser close warning: {exc}")
+        except Exception:
+            pass
         finally:
             self.context = None
             self.page = None
@@ -243,8 +251,8 @@ class SasolMonitor:
         try:
             if self.playwright:
                 self.playwright.stop()
-        except Exception as exc:
-            self.log(f"Playwright close warning: {exc}")
+        except Exception:
+            pass
         finally:
             self.playwright = None
 
@@ -313,6 +321,8 @@ class App(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def set_running(self, running):
+        if self.monitor.closing:
+            return
         self.status_var.set("RUNNING" if running else "READY / STOPPED")
         state = "disabled" if running else "normal"
         self.watch_btn.configure(state=state)
@@ -331,25 +341,11 @@ class App(tk.Tk):
         self.monitor.start_reservation(target_date, hour, duration)
 
     def on_close(self):
-        if not messagebox.askyesno(
-            "Exit Sasol Slot Monitor",
-            "Are you sure you want to exit?\n\n"
-            "Any active monitoring will be stopped and the browser session will be closed."
-        ):
+        if self.monitor.closing:
             return
-
-        self.status_var.set("Closing safely...")
-        self.watch_btn.configure(state="disabled")
-        self.reserve_btn.configure(state="disabled")
-        self.stop_btn.configure(state="disabled")
-        self.exit_btn.configure(state="disabled")
-        self.add_log(f"[{timestamp()}] Closing program safely...")
-
-        # Close on the Tkinter thread only after the worker has been asked to stop.
-        # The monitor's stop Event is interruptible, so the normal 3-minute wait
-        # does not delay the exit.
-        self.monitor.close()
-        self.destroy()
+        if messagebox.askyesno("Exit", "Are you sure you want to exit?\n\nThe monitor will stop and the Sasol browser will be closed safely."):
+            self.monitor.close()
+            self.destroy()
 
 
 if __name__ == "__main__":
