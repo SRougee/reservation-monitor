@@ -16,6 +16,7 @@ SLOT_SELECTOR = '.rz-timeslot[title="Available"]'
 ACTION_TIMEOUT = 3_000
 PAGE_LOAD_TIMEOUT = 15_000
 DOM_UPDATE_TIMEOUT = 3_000
+RESERVATION_REFRESH_DELAY = 0.75
 PROFILE_DIR = Path(".browser-profile")
 
 
@@ -114,8 +115,8 @@ class SasolMonitor:
             .map(e => `${e.title}:${e.className}:${e.textContent.trim()}`).join('|')
         """)
 
-    def _refresh(self, page):
-        before = self._slot_signature(page)
+    def _refresh(self, page, wait_for_change=True):
+        before = self._slot_signature(page) if wait_for_change else None
         buttons = page.locator("button")
         refresh = None
         for i in range(buttons.count()):
@@ -130,6 +131,9 @@ class SasolMonitor:
             raise RuntimeError("Visible Refresh button was not found")
         refresh.click(timeout=ACTION_TIMEOUT)
         self.log("Refresh clicked.")
+        if not wait_for_change:
+            self._wait(RESERVATION_REFRESH_DELAY)
+            return
         try:
             page.wait_for_function("""
                 previous => [...document.querySelectorAll('.rz-timeslot')]
@@ -164,56 +168,100 @@ class SasolMonitor:
         self.log("WATCH MODE stopped.")
         self.gui.after(0, self.gui.set_running, False)
 
-    def _reserve_slot(self, page, target_date, target_hour):
-        slots = self._visible_available(page)
+    def _target_slot(self, page, target_date, target_hour):
+        """Return only the requested date/hour cell, if it is available."""
         target = target_date.strftime("%Y-%m-%d")
-        for slot in slots:
+        wrappers = page.locator(".rz-timeslots-wrapper")
+        for i in range(wrappers.count()):
+            wrapper = wrappers.nth(i)
             try:
-                wrapper = slot.locator("xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' rz-timeslots-wrapper ')]").first
+                if not wrapper.is_visible():
+                    continue
                 date_text = (wrapper.locator(".rz-timeslots-date").inner_text() or "").strip()
-                hour_text = (slot.inner_text() or "").strip()
-                if target in date_text and hour_text == str(target_hour):
-                    self.log(f"TARGET OPEN: {date_text} {hour_text}:00")
-                    slot.click(timeout=ACTION_TIMEOUT)
-                    buttons = page.locator("button")
-                    reserve = None
-                    for i in range(buttons.count()):
-                        b = buttons.nth(i)
-                        try:
-                            if b.is_visible() and "reserve" in b.inner_text().casefold():
-                                reserve = b
-                                break
-                        except Exception:
-                            pass
-                    if reserve is None:
-                        raise RuntimeError("Visible Reserve button was not found")
-                    self.log("Target slot selected. Pressing Reserve...")
-                    reserve.click(timeout=ACTION_TIMEOUT)
-                    self.log("Reserve clicked. Checking website response...")
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        dialogs = page.locator(".rz-dialog[role='dialog']")
-                        for i in range(dialogs.count()):
-                            d = dialogs.nth(i)
+                if target not in date_text:
+                    continue
+                cells = wrapper.locator(".rz-timeslot")
+                for j in range(cells.count()):
+                    cell = cells.nth(j)
+                    if not cell.is_visible():
+                        continue
+                    hour_text = (cell.inner_text() or "").strip()
+                    if hour_text == str(target_hour) and cell.get_attribute("title") == "Available":
+                        return cell, date_text
+                return None, date_text
+            except Exception:
+                continue
+        return None, None
+
+    def _reserve_slot(self, page, target_date, target_hour):
+        """Attempt only the exact requested date/hour once."""
+        slot, date_text = self._target_slot(page, target_date, target_hour)
+        if slot is None:
+            return False
+
+        self.log(f"TARGET OPEN: {date_text} {target_hour}:00")
+        slot.click(timeout=ACTION_TIMEOUT)
+
+        # Find the normal visible Reserve control immediately after selecting
+        # the target. Do not scan or interact with any other slot.
+        reserve = page.locator("button:has-text('Reserve')")
+        visible_reserve = None
+        for i in range(reserve.count()):
+            button = reserve.nth(i)
+            try:
+                if button.is_visible():
+                    visible_reserve = button
+                    break
+            except Exception:
+                pass
+        if visible_reserve is None:
+            raise RuntimeError("Visible Reserve button was not found")
+
+        self.log("Target slot selected. Pressing Reserve...")
+        visible_reserve.click(timeout=ACTION_TIMEOUT)
+        self.log("Reserve clicked. Checking website response...")
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            dialogs = page.locator(".rz-dialog[role='dialog']")
+            for i in range(dialogs.count()):
+                dialog = dialogs.nth(i)
+                try:
+                    if not dialog.is_visible():
+                        continue
+                    text = (dialog.inner_text() or "").strip()
+                    if not text:
+                        continue
+                    self.log(f"Website response: {text}")
+                    lower = text.casefold()
+                    bad = ("no longer available", "error", "failed", "not available")
+                    if any(x in lower for x in bad):
+                        # Dismiss the site's error immediately so the same
+                        # target can be retried after the next refresh.
+                        ok_buttons = dialog.locator("button")
+                        for j in range(ok_buttons.count()):
+                            ok = ok_buttons.nth(j)
                             try:
-                                if d.is_visible():
-                                    text = (d.inner_text() or "").strip()
-                                    self.log(f"Website response: {text}")
-                                    bad = ("no longer available", "error", "failed", "not available")
-                                    return not any(x in text.casefold() for x in bad)
+                                if ok.is_visible() and (ok.inner_text() or "").strip().casefold() == "ok":
+                                    ok.click(timeout=ACTION_TIMEOUT)
+                                    self.log("Sasol error dismissed. Target will be retried.")
+                                    break
                             except Exception:
                                 pass
-                        time.sleep(0.05)
-                    self.log("No explicit confirmation was visible; stopping reservation attempt for safety.")
-                    return False
-            except Exception as exc:
-                self.log(f"Target check error: {exc}")
+                        return False
+                    return True
+                except Exception:
+                    pass
+            time.sleep(0.05)
+
+        self.log("No explicit confirmation was visible; stopping reservation attempt for safety.")
         return False
 
     def _reserve(self, page, target_date, target_hour, duration_minutes):
         self.stop_event.clear()
         self.log(f"RESERVATION MODE started for {target_date:%Y-%m-%d} cell/hour {target_hour}.")
         deadline = datetime.now() + timedelta(minutes=duration_minutes)
+        first_check = True
         while not self.stop_event.is_set() and not self.closing and datetime.now() <= deadline:
             try:
                 if self._reserve_slot(page, target_date, target_hour):
@@ -223,8 +271,12 @@ class SasolMonitor:
                 remaining = max(0, int((deadline - datetime.now()).total_seconds()))
                 if remaining <= 0:
                     break
-                self.log(f"Target not available. Refreshing. Time remaining: {remaining}s")
-                self._refresh(page)
+                if first_check:
+                    self.log(f"Target unavailable. Refreshing and retrying. Time remaining: {remaining}s")
+                    first_check = False
+                else:
+                    self.log(f"Target unavailable. Refreshing and retrying. Time remaining: {remaining}s")
+                self._refresh(page, wait_for_change=False)
             except Exception as exc:
                 self.log(f"Reservation check error: {exc}")
                 if self._wait(1):
@@ -264,8 +316,6 @@ class SasolMonitor:
             pass
         if self.worker.is_alive() and self.worker is not threading.current_thread():
             self.worker.join(timeout=6)
-        if self.worker.is_alive():
-            self.log("Playwright worker did not stop within the normal timeout.")
 
 
 class App(tk.Tk):
